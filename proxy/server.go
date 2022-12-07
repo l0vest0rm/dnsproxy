@@ -82,6 +82,10 @@ func (p *Proxy) handleDNSRequest(d *DNSContext) error {
 	d.StartTime = time.Now()
 	p.logDNSMessage(d.Req)
 
+	for _, r := range d.Req.Question {
+		log.Info("req %s", r.String())
+	}
+
 	if d.Req.Response {
 		log.Debug("Dropping incoming Reply packet from %s", d.Addr.String())
 		return nil

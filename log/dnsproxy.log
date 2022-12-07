@@ -1,0 +1,12 @@
+2022/12/08 00:18:30 [info] Starting dnsproxy dev
+2022/12/08 00:18:30 [info] Starting the DNS proxy server
+2022/12/08 00:18:30 [info] Cache TTL override is enabled. Min=0, Max=600
+2022/12/08 00:18:30 [info] DNS cache is enabled
+2022/12/08 00:18:30 [info] Creating the UDP server socket
+2022/12/08 00:18:30 [info] Listening to udp://[::]:53
+2022/12/08 00:18:30 [info] Creating a TCP server socket
+2022/12/08 00:18:30 [info] Listening to tcp://[::]:53
+2022/12/08 00:18:30 [info] Entering the UDP listener loop on [::]:53
+2022/12/08 00:18:30 [info] Entering the tcp listener loop on [::]:53
+2022/12/08 00:19:09 [info] Stopping the DNS proxy server
+2022/12/08 00:19:09 [info] Stopped the DNS proxy server
