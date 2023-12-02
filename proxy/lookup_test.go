@@ -1,7 +1,8 @@
 package proxy
 
 import (
-	"net"
+	"context"
+	"net/netip"
 	"testing"
 
 	"github.com/AdguardTeam/dnsproxy/upstream"
@@ -9,41 +10,33 @@ import (
 	"github.com/stretchr/testify/require"
 )
 
-func TestLookupIPAddr(t *testing.T) {
-	// Create a simple proxy
-	p := Proxy{}
-	upstreams := make([]upstream.Upstream, 0)
-	// Use AdGuard DNS here
-	opts := &upstream.Options{Timeout: defaultTimeout}
-	dnsUpstream, err := upstream.AddressToUpstream("94.140.14.14", opts)
-	if err != nil {
-		t.Fatalf("cannot prepare the upstream: %s", err)
-	}
-	p.UpstreamConfig = &UpstreamConfig{}
-	p.UpstreamConfig.Upstreams = append(upstreams, dnsUpstream)
+func TestLookupNetIP(t *testing.T) {
+	// Use AdGuard DNS here.
+	dnsUpstream, err := upstream.AddressToUpstream("94.140.14.14", &upstream.Options{
+		Timeout: defaultTimeout,
+	})
+	require.NoError(t, err)
 
-	// Init the proxy
+	p := Proxy{
+		Config: Config{
+			UpstreamConfig: &UpstreamConfig{
+				Upstreams: []upstream.Upstream{dnsUpstream},
+			},
+		},
+	}
+
 	err = p.Init()
 	require.NoError(t, err)
 
-	// Now let's try doing some lookups
-	addrs, err := p.LookupIPAddr("dns.google")
-	assert.Nil(t, err)
-	assert.True(t, len(addrs) == 2 || len(addrs) == 4)
-	assertContainsIP(t, addrs, "8.8.8.8")
-	assertContainsIP(t, addrs, "8.8.4.4")
-	if len(addrs) == 4 {
-		assertContainsIP(t, addrs, "2001:4860:4860::8888")
-		assertContainsIP(t, addrs, "2001:4860:4860::8844")
-	}
-}
+	// Now let's try doing some lookups.
+	addrs, err := p.LookupNetIP(context.Background(), "", "dns.google")
+	require.NoError(t, err)
+	require.NotEmpty(t, addrs)
 
-func assertContainsIP(t *testing.T, addrs []net.IPAddr, ip string) {
-	for _, addr := range addrs {
-		if addr.String() == ip {
-			return
-		}
+	assert.Contains(t, addrs, netip.MustParseAddr("8.8.8.8"))
+	assert.Contains(t, addrs, netip.MustParseAddr("8.8.4.4"))
+	if len(addrs) > 2 {
+		assert.Contains(t, addrs, netip.MustParseAddr("2001:4860:4860::8888"))
+		assert.Contains(t, addrs, netip.MustParseAddr("2001:4860:4860::8844"))
 	}
-
-	t.Fatalf("%s not found in %v", ip, addrs)
 }

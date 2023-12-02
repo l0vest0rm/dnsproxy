@@ -2,12 +2,15 @@ package proxy
 
 import (
 	"crypto/tls"
+	"fmt"
 	"net"
+	"net/netip"
+	"net/url"
 	"time"
 
-	"github.com/AdguardTeam/dnsproxy/upstream"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/golibs/netutil"
 	"github.com/ameshkov/dnscrypt/v2"
 )
 
@@ -38,6 +41,8 @@ type RequestHandler func(p *Proxy, d *DNSContext) error
 type ResponseHandler func(d *DNSContext, err error)
 
 // Config contains all the fields necessary for proxy configuration
+//
+// TODO(a.garipov): Consider extracting conf blocks for better fieldalignment.
 type Config struct {
 	// Listeners
 	// --
@@ -60,10 +65,26 @@ type Config struct {
 
 	// Rate-limiting and anti-DNS amplification measures
 	// --
+	//
+	// TODO(s.chzhen):  Extract ratelimit settings to a separate structure.
 
-	Ratelimit          int      // max number of requests per second from a given IP (0 to disable)
-	RatelimitWhitelist []string // a list of whitelisted client IP addresses
-	RefuseAny          bool     // if true, refuse ANY requests
+	// RatelimitSubnetLenIPv4 is a subnet length for IPv4 addresses used for
+	// rate limiting requests.
+	RatelimitSubnetLenIPv4 int
+
+	// RatelimitSubnetLenIPv6 is a subnet length for IPv6 addresses used for
+	// rate limiting requests.
+	RatelimitSubnetLenIPv6 int
+
+	// Ratelimit is a maximum number of requests per second from a given IP (0
+	// to disable).
+	Ratelimit int
+
+	// RatelimitWhitelist is a list of IP addresses excluded from rate limiting.
+	RatelimitWhitelist []netip.Addr
+
+	// RefuseAny makes proxy refuse the requests of type ANY.
+	RefuseAny bool
 
 	// TrustedProxies is the list of IP addresses and CIDR networks to
 	// detect proxy servers addresses the DoH requests from which should be
@@ -74,17 +95,31 @@ type Config struct {
 	// Upstream DNS servers and their settings
 	// --
 
-	UpstreamConfig *UpstreamConfig     // Upstream DNS servers configuration
-	Fallbacks      []upstream.Upstream // list of fallback resolvers (which will be used if regular upstream failed to answer)
-	UpstreamMode   UpstreamModeType    // How to request the upstream servers
+	// UpstreamConfig is a general set of DNS servers to forward requests to.
+	UpstreamConfig *UpstreamConfig
+
+	// PrivateRDNSUpstreamConfig is the set of upstream DNS servers for
+	// resolving private IP addresses.  All the requests considered private will
+	// be resolved via these upstream servers.  Such queries will finish with
+	// [upstream.ErrNoUpstream] if it's empty.
+	PrivateRDNSUpstreamConfig *UpstreamConfig
+
+	// Fallbacks is a list of fallback resolvers.  Those will be used if the
+	// general set fails responding.
+	Fallbacks *UpstreamConfig
+
+	// UpstreamMode determines the logic through which upstreams will be used.
+	UpstreamMode UpstreamModeType
+
 	// FastestPingTimeout is the timeout for waiting the first successful
-	// dialing when the UpstreamMode is set to UModeFastestAddr.
-	// Non-positive value will be replaced with the default one.
+	// dialing when the UpstreamMode is set to UModeFastestAddr.  Non-positive
+	// value will be replaced with the default one.
 	FastestPingTimeout time.Duration
 
-	// BogusNXDomain - transforms responses that contain at least one of the given IP addresses into NXDOMAIN
-	// Similar to dnsmasq's "bogus-nxdomain"
-	BogusNXDomain []*net.IPNet
+	// BogusNXDomain is the set of networks used to transform responses into
+	// NXDOMAIN ones if they contain at least a single IP address within these
+	// networks.  It's similar to dnsmasq's "bogus-nxdomain".
+	BogusNXDomain []netip.Prefix
 
 	// Enable EDNS Client Subnet option DNS requests to the upstream server will
 	// contain an OPT record with Client Subnet option.  If the original request
@@ -107,7 +142,9 @@ type Config struct {
 	// store these responses in general cache (without subnet) so they will
 	// never be used for clients with public IP addresses.
 	EnableEDNSClientSubnet bool
-	EDNSAddr               net.IP // ECS IP used in request
+
+	// EDNSAddr is the ECS IP used in request.
+	EDNSAddr net.IP
 
 	// Cache settings
 	// --
@@ -130,6 +167,15 @@ type Config struct {
 	// Other settings
 	// --
 
+	// HTTPSServerName sets the Server header of the HTTPS server responses, if
+	// not empty.
+	HTTPSServerName string
+
+	// Userinfo is the sole permitted userinfo for the DoH basic authentication.
+	// If Userinfo is set, all DoH queries are required to have this basic
+	// authentication information.
+	Userinfo *url.Userinfo
+
 	// MaxGoroutines is the maximum number of goroutines processing DNS
 	// requests.  Important for mobile users.
 	//
@@ -141,37 +187,106 @@ type Config struct {
 	// The size of the read buffer on the underlying socket. Larger read buffers can handle
 	// larger bursts of requests before packets get dropped.
 	UDPBufferSize int
+
+	// UseDNS64 enables DNS64 handling.  If true, proxy will translate IPv4
+	// answers into IPv6 answers using first of DNS64Prefs.  Note also that PTR
+	// requests for addresses within the specified networks are considered
+	// private and will be forwarded as PrivateRDNSUpstreamConfig specifies.
+	UseDNS64 bool
+
+	// DNS64Prefs is the set of NAT64 prefixes used for DNS64 handling.  nil
+	// value disables the feature.  An empty value will be interpreted as the
+	// default Well-Known Prefix.
+	DNS64Prefs []netip.Prefix
+
+	// PreferIPv6 tells the proxy to prefer IPv6 addresses when bootstrapping
+	// upstreams that use hostnames.
+	PreferIPv6 bool
 }
 
-// validateConfig verifies that the supplied configuration is valid and returns an error if it's not
+// validateConfig verifies that the supplied configuration is valid and returns
+// an error if it's not.
 func (p *Proxy) validateConfig() error {
-	if p.started {
-		return errors.Error("server has been already started")
-	}
-
 	err := p.validateListenAddrs()
 	if err != nil {
+		// Don't wrap the error since it's informative enough as is.
 		return err
 	}
 
-	if p.UpstreamConfig == nil {
-		return errors.Error("no default upstreams specified")
+	err = p.UpstreamConfig.validate()
+	if err != nil {
+		return fmt.Errorf("validating general upstreams: %w", err)
 	}
 
-	if len(p.UpstreamConfig.Upstreams) == 0 {
-		if len(p.UpstreamConfig.DomainReservedUpstreams) == 0 {
-			return errors.Error("no upstreams specified")
-		}
+	// Allow both [Proxy.PrivateRDNSUpstreamConfig] and [Proxy.Fallbacks] to be
+	// nil, but not empty.  nil means using the default values for those.
 
-		return errors.Error("no default upstreams specified")
+	err = p.PrivateRDNSUpstreamConfig.validate()
+	if err != nil && !errors.Is(err, errNoDefaultUpstreams) {
+		return fmt.Errorf("validating private RDNS upstreams: %w", err)
 	}
 
+	err = p.Fallbacks.validate()
+	if err != nil && !errors.Is(err, errNoDefaultUpstreams) {
+		return fmt.Errorf("validating fallbacks: %w", err)
+	}
+
+	err = p.validateRatelimit()
+	if err != nil {
+		return fmt.Errorf("validating ratelimit: %w", err)
+	}
+
+	p.logConfigInfo()
+
+	return nil
+}
+
+// validateRatelimit validates ratelimit configuration and returns an error if
+// it's invalid.
+func (p *Proxy) validateRatelimit() (err error) {
+	if p.Ratelimit == 0 {
+		return nil
+	}
+
+	err = checkInclusion(p.RatelimitSubnetLenIPv4, 0, netutil.IPv4BitLen)
+	if err != nil {
+		return fmt.Errorf("ratelimit subnet len ipv4 is invalid: %w", err)
+	}
+
+	err = checkInclusion(p.RatelimitSubnetLenIPv6, 0, netutil.IPv6BitLen)
+	if err != nil {
+		return fmt.Errorf("ratelimit subnet len ipv6 is invalid: %w", err)
+	}
+
+	return nil
+}
+
+// checkInclusion returns an error if a n is not in the inclusive range between
+// minN and maxN.
+func checkInclusion(n, minN, maxN int) (err error) {
+	switch {
+	case n < minN:
+		return fmt.Errorf("value %d less than min %d", n, minN)
+	case n > maxN:
+		return fmt.Errorf("value %d greater than max %d", n, maxN)
+	}
+
+	return nil
+}
+
+// logConfigInfo logs proxy configuration information.
+func (p *Proxy) logConfigInfo() {
 	if p.CacheMinTTL > 0 || p.CacheMaxTTL > 0 {
 		log.Info("Cache TTL override is enabled. Min=%d, Max=%d", p.CacheMinTTL, p.CacheMaxTTL)
 	}
 
 	if p.Ratelimit > 0 {
-		log.Info("Ratelimit is enabled and set to %d rps", p.Ratelimit)
+		log.Info(
+			"Ratelimit is enabled and set to %d rps, IPv4 subnet mask len %d, IPv6 subnet mask len %d",
+			p.Ratelimit,
+			p.RatelimitSubnetLenIPv4,
+			p.RatelimitSubnetLenIPv6,
+		)
 	}
 
 	if p.RefuseAny {
@@ -181,11 +296,9 @@ func (p *Proxy) validateConfig() error {
 	if len(p.BogusNXDomain) > 0 {
 		log.Info("%d bogus-nxdomain IP specified", len(p.BogusNXDomain))
 	}
-
-	return nil
 }
 
-// validateListenAddrs returns an error if the addressses are not configured
+// validateListenAddrs returns an error if the addresses are not configured
 // properly.
 func (p *Proxy) validateListenAddrs() error {
 	if !p.hasListenAddrs() {
@@ -216,15 +329,11 @@ func (p *Proxy) validateListenAddrs() error {
 
 // hasListenAddrs - is there any addresses to listen to?
 func (p *Proxy) hasListenAddrs() bool {
-	if p.UDPListenAddr == nil &&
-		p.TCPListenAddr == nil &&
-		p.TLSListenAddr == nil &&
-		p.HTTPSListenAddr == nil &&
-		p.QUICListenAddr == nil &&
-		p.DNSCryptUDPListenAddr == nil &&
-		p.DNSCryptTCPListenAddr == nil {
-		return false
-	}
-
-	return true
+	return p.UDPListenAddr != nil ||
+		p.TCPListenAddr != nil ||
+		p.TLSListenAddr != nil ||
+		p.HTTPSListenAddr != nil ||
+		p.QUICListenAddr != nil ||
+		p.DNSCryptUDPListenAddr != nil ||
+		p.DNSCryptTCPListenAddr != nil
 }

@@ -3,25 +3,28 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"io"
 	"net"
 	"net/http"
+	"net/netip"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/AdguardTeam/dnsproxy/fastip"
-	"github.com/AdguardTeam/dnsproxy/proxyutil"
+	proxynetutil "github.com/AdguardTeam/dnsproxy/internal/netutil"
 	"github.com/AdguardTeam/dnsproxy/upstream"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/log"
 	"github.com/AdguardTeam/golibs/netutil"
 	"github.com/ameshkov/dnscrypt/v2"
-	"github.com/lucas-clemente/quic-go"
-	"github.com/lucas-clemente/quic-go/http3"
 	"github.com/miekg/dns"
 	gocache "github.com/patrickmn/go-cache"
+	"github.com/quic-go/quic-go"
+	"github.com/quic-go/quic-go/http3"
+	"golang.org/x/exp/slices"
 )
 
 const (
@@ -54,6 +57,8 @@ const (
 )
 
 // Proxy combines the proxy server state and configuration
+//
+// TODO(a.garipov): Consider extracting conf blocks for better fieldalignment.
 type Proxy struct {
 	// counter is the counter of messages.  It must only be incremented
 	// atomically, so it must be the first member of the struct to make sure
@@ -62,40 +67,71 @@ type Proxy struct {
 	// See https://golang.org/pkg/sync/atomic/#pkg-note-BUG.
 	counter uint64
 
-	started bool // Started flag
+	// started indicates if the proxy has been started.
+	started bool
 
 	// Listeners
 	// --
 
-	udpListen         []*net.UDPConn       // UDP listen connections
-	tcpListen         []net.Listener       // TCP listeners
-	tlsListen         []net.Listener       // TLS listeners
-	quicListen        []quic.EarlyListener // QUIC listeners
-	httpsListen       []net.Listener       // HTTPS listeners
-	httpsServer       *http.Server         // HTTPS server instance
-	h3Listen          []quic.EarlyListener // HTTP/3 listeners
-	h3Server          *http3.Server        // HTTP/3 server instance
-	dnsCryptUDPListen []*net.UDPConn       // UDP listen connections for DNSCrypt
-	dnsCryptTCPListen []net.Listener       // TCP listeners for DNSCrypt
-	dnsCryptServer    *dnscrypt.Server     // DNSCrypt server instance
+	// udpListen are the listened UDP connections.
+	udpListen []*net.UDPConn
+
+	// tcpListen are the listened TCP connections.
+	tcpListen []net.Listener
+
+	// tlsListen are the listened TCP connections with TLS.
+	tlsListen []net.Listener
+
+	// quicListen are the listened QUIC connections.
+	quicListen []*quic.EarlyListener
+
+	// httpsListen are the listened HTTPS connections.
+	httpsListen []net.Listener
+
+	// h3Listen are the listened HTTP/3 connections.
+	h3Listen []*quic.EarlyListener
+
+	// httpsServer serves queries received over HTTPS.
+	httpsServer *http.Server
+
+	// h3Server serves queries received over HTTP/3.
+	h3Server *http3.Server
+
+	// dnsCryptUDPListen are the listened UDP connections for DNSCrypt.
+	dnsCryptUDPListen []*net.UDPConn
+
+	// dnsCryptTCPListen are the listened TCP connections for DNSCrypt.
+	dnsCryptTCPListen []net.Listener
+
+	// dnsCryptServer serves DNSCrypt queries.
+	dnsCryptServer *dnscrypt.Server
 
 	// Upstream
 	// --
 
-	upstreamRttStats map[string]int // Map of upstream addresses and their rtt. Used to sort upstreams "from fast to slow"
-	rttLock          sync.Mutex     // Synchronizes access to the upstreamRttStats map
+	// upstreamRTTStats is a map of upstream addresses and their rtt.  Used to
+	// sort upstreams by their latency.
+	upstreamRTTStats map[string]int
+
+	// rttLock protects upstreamRTTStats.
+	rttLock sync.Mutex
 
 	// DNS64 (in case dnsproxy works in a NAT64/DNS64 network)
 	// --
 
-	nat64Prefix     []byte     // NAT 64 prefix
-	nat64PrefixLock sync.Mutex // Prefix lock
+	// dns64Prefs is a set of NAT64 prefixes that are used to detect and
+	// construct DNS64 responses.  The DNS64 function is disabled if it is
+	// empty.
+	dns64Prefs []netip.Prefix
 
 	// Ratelimit
 	// --
 
-	ratelimitBuckets *gocache.Cache // where the ratelimiters are stored, per IP
-	ratelimitLock    sync.Mutex     // Synchronizes access to ratelimitBuckets
+	// ratelimitBuckets is a storage for ratelimiters for individual IPs.
+	ratelimitBuckets *gocache.Cache
+
+	// ratelimitLock protects ratelimitBuckets.
+	ratelimitLock sync.Mutex
 
 	// proxyVerifier checks if the proxy is in the trusted list.
 	proxyVerifier netutil.SubnetSet
@@ -104,7 +140,10 @@ type Proxy struct {
 	// --
 
 	// cache is used to cache requests.  It is disabled if nil.
+	//
+	// TODO(d.kolyshev): Move this cache to [Proxy.UpstreamConfig] field.
 	cache *cache
+
 	// shortFlighter is used to resolve the expired cached requests without
 	// repetitions.
 	shortFlighter *optimisticResolver
@@ -112,14 +151,20 @@ type Proxy struct {
 	// FastestAddr module
 	// --
 
-	fastestAddr *fastip.FastestAddr // fastest-addr module
+	// fastestAddr finds the fastest IP address for the resolved domain.
+	fastestAddr *fastip.FastestAddr
 
 	// Other
 	// --
 
-	bytesPool    *sync.Pool // bytes pool to avoid unnecessary allocations when reading DNS packets
-	udpOOBSize   int        // size for received OOB data
-	sync.RWMutex            // protects parallel access to proxy structures
+	// bytesPool is a pool of byte slices used to read DNS packets.
+	bytesPool *sync.Pool
+
+	// udpOOBSize is the size of the out-of-band data for UDP connections.
+	udpOOBSize int
+
+	// RWMutex protects the whole proxy.
+	sync.RWMutex
 
 	// requestGoroutinesSema limits the number of simultaneous requests.
 	//
@@ -131,15 +176,24 @@ type Proxy struct {
 	// See also: https://github.com/AdguardTeam/AdGuardHome/issues/2242.
 	requestGoroutinesSema semaphore
 
-	Config // proxy configuration
+	// Config is the proxy configuration.
+	//
+	// TODO(a.garipov): Remove this embed and create a proper initializer.
+	Config
 }
 
-// Init - initializes the proxy structures but does not start it
+// Init populates fields of p but does not start listeners.
 func (p *Proxy) Init() (err error) {
+	// TODO(s.chzhen):  Consider moving to [Proxy.validateConfig].
+	err = p.validateBasicAuth()
+	if err != nil {
+		return fmt.Errorf("basic auth: %w", err)
+	}
+
 	p.initCache()
 
 	if p.MaxGoroutines > 0 {
-		log.Info("MaxGoroutines is set to %d", p.MaxGoroutines)
+		log.Info("dnsproxy: max goroutines is set to %d", p.MaxGoroutines)
 
 		p.requestGoroutinesSema, err = newChanSemaphore(p.MaxGoroutines)
 		if err != nil {
@@ -149,7 +203,7 @@ func (p *Proxy) Init() (err error) {
 		p.requestGoroutinesSema = newNoopSemaphore()
 	}
 
-	p.udpOOBSize = proxyutil.UDPGetOOBSize()
+	p.udpOOBSize = proxynetutil.UDPGetOOBSize()
 	p.bytesPool = &sync.Pool{
 		New: func() interface{} {
 			// 2 bytes may be used to store packet length (see TCP/TLS)
@@ -160,7 +214,8 @@ func (p *Proxy) Init() (err error) {
 	}
 
 	if p.UpstreamMode == UModeFastestAddr {
-		log.Printf("Fastest IP is enabled")
+		log.Info("dnsproxy: fastest ip is enabled")
+
 		p.fastestAddr = fastip.NewFastestAddr()
 		if timeout := p.FastestPingTimeout; timeout > 0 {
 			p.fastestAddr.PingWaitTimeout = timeout
@@ -175,15 +230,43 @@ func (p *Proxy) Init() (err error) {
 
 	p.proxyVerifier = netutil.SliceSubnetSet(trusted)
 
+	err = p.setupDNS64()
+	if err != nil {
+		return fmt.Errorf("setting up DNS64: %w", err)
+	}
+
+	p.RatelimitWhitelist = slices.Clone(p.RatelimitWhitelist)
+	slices.SortFunc(p.RatelimitWhitelist, netip.Addr.Compare)
+
+	return nil
+}
+
+// validateBasicAuth validates the basic-auth mode settings if p.Config.Userinfo
+// is set.
+func (p *Proxy) validateBasicAuth() (err error) {
+	conf := p.Config
+	if conf.Userinfo == nil {
+		return nil
+	}
+
+	if len(conf.HTTPSListenAddr) == 0 {
+		return errors.Error("no https addrs")
+	}
+
 	return nil
 }
 
 // Start initializes the proxy server and starts listening
 func (p *Proxy) Start() (err error) {
+	log.Info("dnsproxy: starting dns proxy server")
+
 	p.Lock()
 	defer p.Unlock()
 
-	log.Info("Starting the DNS proxy server")
+	if p.started {
+		return errors.Error("server has been already started")
+	}
+
 	err = p.validateConfig()
 	if err != nil {
 		return err
@@ -194,12 +277,15 @@ func (p *Proxy) Start() (err error) {
 		return err
 	}
 
-	err = p.startListeners()
+	// TODO(a.garipov): Accept a context into this method.
+	ctx := context.Background()
+	err = p.startListeners(ctx)
 	if err != nil {
-		return err
+		return fmt.Errorf("starting listeners: %w", err)
 	}
 
 	p.started = true
+
 	return nil
 }
 
@@ -217,12 +303,14 @@ func closeAll[C io.Closer](errs []error, closers ...C) (appended []error) {
 
 // Stop stops the proxy server including all its listeners
 func (p *Proxy) Stop() error {
-	log.Info("Stopping the DNS proxy server")
+	log.Info("dnsproxy: stopping dns proxy server")
 
 	p.Lock()
 	defer p.Unlock()
+
 	if !p.started {
-		log.Info("The DNS proxy server is not started")
+		log.Info("dnsproxy: dns proxy server is not started")
+
 		return nil
 	}
 
@@ -260,12 +348,20 @@ func (p *Proxy) Stop() error {
 	errs = closeAll(errs, p.dnsCryptTCPListen...)
 	p.dnsCryptTCPListen = nil
 
-	if p.UpstreamConfig != nil {
-		errs = closeAll(errs, p.UpstreamConfig)
+	for _, u := range []*UpstreamConfig{
+		p.UpstreamConfig,
+		p.PrivateRDNSUpstreamConfig,
+		p.Fallbacks,
+	} {
+		if u != nil {
+			errs = closeAll(errs, u)
+		}
 	}
 
 	p.started = false
-	log.Println("Stopped the DNS proxy server")
+
+	log.Println("dnsproxy: stopped dns proxy server")
+
 	if len(errs) > 0 {
 		return errors.List("stopping dns proxy server", errs...)
 	}
@@ -369,65 +465,142 @@ func (p *Proxy) Addr(proto Proto) net.Addr {
 	}
 }
 
+// needsLocalUpstream returns true if the request should be handled by a private
+// upstream servers.
+func (p *Proxy) needsLocalUpstream(req *dns.Msg) (ok bool) {
+	if req.Question[0].Qtype != dns.TypePTR {
+		return false
+	}
+
+	host := req.Question[0].Name
+	ip, err := netutil.IPFromReversedAddr(host)
+	if err != nil {
+		log.Debug("dnsproxy: failed to parse ip from ptr request: %s", err)
+
+		return false
+	}
+
+	return p.shouldStripDNS64(ip)
+}
+
+// selectUpstreams returns the upstreams to use for the specified host.  It
+// firstly considers custom upstreams if those aren't empty and then the
+// configured ones.  The returned slice may be empty or nil.
+func (p *Proxy) selectUpstreams(d *DNSContext) (upstreams []upstream.Upstream) {
+	q := d.Req.Question[0]
+	host := q.Name
+	qtype := q.Qtype
+
+	if !p.needsLocalUpstream(d.Req) {
+		// TODO(e.burkov):  Use the same logic for private upstreams as well,
+		// when those start supporting non-PTR requests.
+		getUpstreams := (*UpstreamConfig).getUpstreamsForDomain
+		if qtype == dns.TypeDS {
+			getUpstreams = (*UpstreamConfig).getUpstreamsForDS
+		}
+
+		if custom := d.CustomUpstreamConfig; custom != nil {
+			// Try to use custom.
+			upstreams = getUpstreams(custom.upstream, host)
+			if len(upstreams) > 0 {
+				return upstreams
+			}
+		}
+
+		// Use configured.
+		return getUpstreams(p.UpstreamConfig, host)
+	}
+
+	// Use private upstreams.
+	private := p.PrivateRDNSUpstreamConfig
+	if private == nil {
+		return nil
+	}
+
+	// TODO(e.burkov):  Detect against the actual configured subnet set.
+	// Perhaps, even much earlier.
+	if !netutil.IsLocallyServedAddr(d.Addr.Addr()) {
+		return nil
+	}
+
+	return private.getUpstreamsForDomain(host)
+}
+
 // replyFromUpstream tries to resolve the request.
 func (p *Proxy) replyFromUpstream(d *DNSContext) (ok bool, err error) {
 	req := d.Req
-	host := req.Question[0].Name
-	var upstreams []upstream.Upstream
-	// Get custom upstreams first.  Note that they might be empty.
-	if d.CustomUpstreamConfig != nil {
-		upstreams = d.CustomUpstreamConfig.getUpstreamsForDomain(host)
-	}
-	// If nothing is found in the custom upstreams, start using the default
-	// ones.
-	if upstreams == nil {
-		upstreams = p.UpstreamConfig.getUpstreamsForDomain(host)
+
+	upstreams := p.selectUpstreams(d)
+	if len(upstreams) == 0 {
+		return false, fmt.Errorf("selecting general upstream: %w", upstream.ErrNoUpstreams)
 	}
 
 	start := time.Now()
-	// Perform the DNS request.
-	var reply *dns.Msg
-	var u upstream.Upstream
-	reply, u, err = p.exchange(req, upstreams)
-	if p.isNAT64PrefixAvailable() && p.isEmptyAAAAResponse(reply, req) {
-		log.Tracef("received an empty AAAA response, checking DNS64")
-		reply, u, err = p.checkDNS64(req, reply, upstreams)
-	} else if p.isBogusNXDomain(reply) {
-		log.Tracef("response ip is contained in bogus-nxdomain list")
-		reply = p.genWithRCode(reply, dns.RcodeNameError)
-	}
+	src := "upstream"
 
-	log.Tracef("RTT: %s", time.Since(start))
+	// Perform the DNS request.
+	resp, u, err := p.exchange(req, upstreams)
+	if dns64Ups := p.performDNS64(req, resp, upstreams); dns64Ups != nil {
+		u = dns64Ups
+	} else if p.isBogusNXDomain(resp) {
+		log.Debug("proxy: replying from upstream: response contains bogus-nxdomain ip")
+		resp = p.genWithRCode(req, dns.RcodeNameError)
+	}
 
 	if err != nil && p.Fallbacks != nil {
-		log.Tracef("using the fallback upstream due to %s", err)
+		log.Debug("proxy: replying from upstream: using fallback due to %s", err)
 
-		reply, u, err = upstream.ExchangeParallel(p.Fallbacks, req)
+		// Reset the timer.
+		start = time.Now()
+		src = "fallback"
+
+		upstreams = p.Fallbacks.getUpstreamsForDomain(req.Question[0].Name)
+		if len(upstreams) == 0 {
+			return false, fmt.Errorf("selecting fallback upstream: %w", upstream.ErrNoUpstreams)
+		}
+
+		resp, u, err = upstream.ExchangeParallel(upstreams, req)
 	}
 
-	if ok = reply != nil; ok {
-		// This branch handles the successfully exchanged response.
+	if err != nil {
+		log.Debug("proxy: replying from %s: %s", src, err)
+	}
 
-		// Set upstream that have resolved the request to DNSContext.
-		d.Upstream = u
-		p.setMinMaxTTL(reply)
+	if resp != nil {
+		rtt := time.Since(start)
+		log.Debug("proxy: replying from %s: rtt is %s", src, rtt)
 
+		d.QueryDuration = rtt
+	}
+
+	p.handleExchangeResult(d, req, resp, u)
+
+	return resp != nil, err
+}
+
+// handleExchangeResult handles the result after the upstream exchange.  It sets
+// the response to d and sets the upstream that have resolved the request.  If
+// the response is nil, it generates a server failure response.
+func (p *Proxy) handleExchangeResult(d *DNSContext, req, resp *dns.Msg, u upstream.Upstream) {
+	if resp == nil {
+		d.Res = p.genServerFailure(req)
+		d.hasEDNS0 = false
+
+		return
+	}
+
+	d.Upstream = u
+	d.Res = resp
+
+	p.setMinMaxTTL(resp)
+	if len(req.Question) > 0 && len(resp.Question) == 0 {
 		// Explicitly construct the question section since some upstreams may
 		// respond with invalidly constructed messages which cause out-of-range
 		// panics afterwards.
 		//
 		// See https://github.com/AdguardTeam/AdGuardHome/issues/3551.
-		if len(req.Question) > 0 && len(reply.Question) == 0 {
-			reply.Question = make([]dns.Question, 1)
-			reply.Question[0] = req.Question[0]
-		}
-	} else {
-		reply = p.genServerFailure(req)
-		d.hasEDNS0 = false
+		resp.Question = []dns.Question{req.Question[0]}
 	}
-	d.Res = reply
-
-	return ok, err
 }
 
 // addDO adds EDNS0 RR if needed and sets DO bit of msg to true.
@@ -448,54 +621,81 @@ const defaultUDPBufSize = 2048
 
 // Resolve is the default resolving method used by the DNS proxy to query
 // upstream servers.
-func (p *Proxy) Resolve(d *DNSContext) (err error) {
+func (p *Proxy) Resolve(dctx *DNSContext) (err error) {
 	if p.EnableEDNSClientSubnet {
-		d.processECS(p.EDNSAddr)
+		dctx.processECS(p.EDNSAddr)
 	}
 
-	d.calcFlagsAndSize()
+	dctx.calcFlagsAndSize()
 
-	// Use cache only if it's enabled and the query doesn't use custom upstream.
 	// Also don't lookup the cache for responses with DNSSEC checking disabled
 	// since only validated responses are cached and those may be not the
 	// desired result for user specifying CD flag.
-	cacheWorks := p.cache != nil && d.CustomUpstreamConfig == nil && !d.Req.CheckingDisabled
+	cacheWorks := p.cacheWorks(dctx)
 	if cacheWorks {
-		if p.replyFromCache(d) {
+		if p.replyFromCache(dctx) {
 			// Complete the response from cache.
-			d.scrub()
+			dctx.scrub()
 
 			return nil
 		}
 
 		// On cache miss request for DNSSEC from the upstream to cache it
 		// afterwards.
-		addDO(d.Req)
+		addDO(dctx.Req)
 	}
 
 	var ok bool
-	ok, err = p.replyFromUpstream(d)
+	ok, err = p.replyFromUpstream(dctx)
 
 	// Don't cache the responses having CD flag, just like Dnsmasq does.  It
 	// prevents the cache from being poisoned with unvalidated answers which may
 	// differ from validated ones.
 	//
 	// See https://github.com/imp/dnsmasq/blob/770bce967cfc9967273d0acfb3ea018fb7b17522/src/forward.c#L1169-L1172.
-	if cacheWorks && ok && !d.Res.CheckingDisabled {
+	if cacheWorks && ok && !dctx.Res.CheckingDisabled {
 		// Cache the response with DNSSEC RRs.
-		p.cacheResp(d)
+		p.cacheResp(dctx)
 	}
 
-	filterMsg(d.Res, d.Res, d.adBit, d.doBit, 0)
+	// It is possible that the response is nil if the upstream hasn't been
+	// chosen.
+	if dctx.Res != nil {
+		filterMsg(dctx.Res, dctx.Res, dctx.adBit, dctx.doBit, 0)
+	}
 
 	// Complete the response.
-	d.scrub()
+	dctx.scrub()
 
 	if p.ResponseHandler != nil {
-		p.ResponseHandler(d, err)
+		p.ResponseHandler(dctx, err)
 	}
 
 	return err
+}
+
+// cacheWorks returns true if the cache works for the given context.  If not, it
+// returns false and logs the reason why.
+func (p *Proxy) cacheWorks(dctx *DNSContext) (ok bool) {
+	var reason string
+	switch {
+	case p.cache == nil:
+		reason = "disabled"
+	case dctx.CustomUpstreamConfig != nil && dctx.CustomUpstreamConfig.cache == nil:
+		// In case of custom upstream cache is not configured, the global proxy
+		// cache cannot be used because different upstreams can return different
+		// results.
+		// See https://github.com/AdguardTeam/dnsproxy/issues/169.
+		reason = "custom upstreams cache is not configured"
+	case dctx.Req.CheckingDisabled:
+		reason = "dnssec check disabled"
+	default:
+		return true
+	}
+
+	log.Debug("dnsproxy: cache: %s; not caching", reason)
+
+	return false
 }
 
 // processECS adds EDNS Client Subnet data into the request from d.
@@ -504,7 +704,7 @@ func (dctx *DNSContext) processECS(cliIP net.IP) {
 		if ones, _ := ecs.Mask.Size(); ones != 0 {
 			dctx.ReqECS = ecs
 
-			log.Debug("passing through ecs: %s", dctx.ReqECS)
+			log.Debug("dnsproxy: passing through ecs: %s", dctx.ReqECS)
 
 			return
 		}
@@ -512,10 +712,7 @@ func (dctx *DNSContext) processECS(cliIP net.IP) {
 
 	// Set ECS.
 	if cliIP == nil {
-		cliIP, _ = netutil.IPAndPortFromAddr(dctx.Addr)
-		if cliIP == nil {
-			return
-		}
+		cliIP = dctx.Addr.Addr().AsSlice()
 	}
 
 	if !netutil.IsSpecialPurpose(cliIP) {
@@ -523,16 +720,15 @@ func (dctx *DNSContext) processECS(cliIP net.IP) {
 		// Section 6.
 		dctx.ReqECS = setECS(dctx.Req, cliIP, 0)
 
-		log.Debug("setting ecs: %s", dctx.ReqECS)
+		log.Debug("dnsproxy: setting ecs: %s", dctx.ReqECS)
 	}
 }
 
 // newDNSContext returns a new properly initialized *DNSContext.
 func (p *Proxy) newDNSContext(proto Proto, req *dns.Msg) (d *DNSContext) {
 	return &DNSContext{
-		Proto:     proto,
-		Req:       req,
-		StartTime: time.Now(),
+		Proto: proto,
+		Req:   req,
 
 		RequestID: atomic.AddUint64(&p.counter, 1),
 	}

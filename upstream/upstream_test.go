@@ -12,6 +12,7 @@ import (
 	"io"
 	"math/big"
 	"net"
+	"net/netip"
 	"net/url"
 	"os"
 	"sync"
@@ -19,7 +20,9 @@ import (
 	"time"
 
 	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/golibs/netutil"
 	"github.com/AdguardTeam/golibs/testutil"
+	"github.com/ameshkov/dnsstamps"
 	"github.com/miekg/dns"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
@@ -45,9 +48,14 @@ func TestUpstream_bootstrapTimeout(t *testing.T) {
 	require.NoError(t, err)
 	testutil.CleanupAndRequireSuccess(t, udpListener.Close)
 
+	rslv, err := NewUpstreamResolver(udpListener.LocalAddr().String(), &Options{
+		Timeout: timeout,
+	})
+	require.NoError(t, err)
+
 	// Create an upstream that uses this faulty bootstrap.
 	u, err := AddressToUpstream("tls://random-domain-name", &Options{
-		Bootstrap: []string{udpListener.LocalAddr().String()},
+		Bootstrap: rslv,
 		Timeout:   timeout,
 	})
 	require.NoError(t, err)
@@ -58,17 +66,16 @@ func TestUpstream_bootstrapTimeout(t *testing.T) {
 	for i := 0; i < count; i++ {
 		go func(idx int) {
 			t.Logf("Start %d", idx)
-			start := time.Now()
 			req := createTestMessage()
 
-			_, err := u.Exchange(req)
-
-			if err == nil {
-				// Must not happen since bootstrap server cannot work.
-				abort <- fmt.Sprintf("the upstream must have timed out: %v", err)
-			}
-
+			start := time.Now()
+			_, rErr := u.Exchange(req)
 			elapsed := time.Since(start)
+
+			if rErr == nil {
+				// Must not happen since bootstrap server cannot work.
+				abort <- fmt.Sprintf("the upstream must have timed out: %v", rErr)
+			}
 
 			// Check that the test didn't take too much time compared to the
 			// configured timeout.  The actual elapsed time may be higher than
@@ -98,95 +105,105 @@ func TestUpstream_bootstrapTimeout(t *testing.T) {
 }
 
 func TestUpstreams(t *testing.T) {
+	googleRslv, err := NewUpstreamResolver("8.8.8.8:53", &Options{
+		Timeout: timeout,
+	})
+	require.NoError(t, err)
+	cloudflareRslv, err := NewUpstreamResolver("1.0.0.1:53", &Options{
+		Timeout: timeout,
+	})
+	require.NoError(t, err)
+
 	upstreams := []struct {
+		bootstrap Resolver
 		address   string
-		bootstrap []string
 	}{{
+		bootstrap: googleRslv,
 		address:   "8.8.8.8:53",
-		bootstrap: []string{"8.8.8.8:53"},
 	}, {
+		bootstrap: nil,
 		address:   "1.1.1.1",
-		bootstrap: []string{},
 	}, {
+		bootstrap: cloudflareRslv,
 		address:   "1.1.1.1",
-		bootstrap: []string{"1.0.0.1"},
 	}, {
+		bootstrap: nil,
 		address:   "tcp://1.1.1.1:53",
-		bootstrap: []string{},
 	}, {
+		bootstrap: nil,
 		address:   "94.140.14.14:5353",
-		bootstrap: []string{},
 	}, {
+		bootstrap: nil,
 		address:   "tls://1.1.1.1",
-		bootstrap: []string{},
 	}, {
+		bootstrap: nil,
 		address:   "tls://9.9.9.9:853",
-		bootstrap: []string{},
 	}, {
+		bootstrap: googleRslv,
 		address:   "tls://dns.adguard.com",
-		bootstrap: []string{"8.8.8.8:53"},
 	}, {
+		bootstrap: googleRslv,
 		address:   "tls://dns.adguard.com:853",
-		bootstrap: []string{"8.8.8.8:53"},
 	}, {
+		bootstrap: googleRslv,
 		address:   "tls://dns.adguard.com:853",
-		bootstrap: []string{"8.8.8.8"},
 	}, {
+		bootstrap: nil,
 		address:   "tls://one.one.one.one",
-		bootstrap: []string{},
 	}, {
+		bootstrap: googleRslv,
 		address:   "https://1dot1dot1dot1.cloudflare-dns.com/dns-query",
-		bootstrap: []string{"8.8.8.8:53"},
 	}, {
+		bootstrap: nil,
 		address:   "https://dns.google/dns-query",
-		bootstrap: []string{},
 	}, {
+		bootstrap: nil,
 		address:   "https://doh.opendns.com/dns-query",
-		bootstrap: []string{},
 	}, {
 		// AdGuard DNS (DNSCrypt)
+		bootstrap: nil,
 		address:   "sdns://AQIAAAAAAAAAFDE3Ni4xMDMuMTMwLjEzMDo1NDQzINErR_JS3PLCu_iZEIbq95zkSV2LFsigxDIuUso_OQhzIjIuZG5zY3J5cHQuZGVmYXVsdC5uczEuYWRndWFyZC5jb20",
-		bootstrap: []string{},
 	}, {
 		// AdGuard Family (DNSCrypt)
+		bootstrap: googleRslv,
 		address:   "sdns://AQIAAAAAAAAAFDE3Ni4xMDMuMTMwLjEzMjo1NDQzILgxXdexS27jIKRw3C7Wsao5jMnlhvhdRUXWuMm1AFq6ITIuZG5zY3J5cHQuZmFtaWx5Lm5zMS5hZGd1YXJkLmNvbQ",
-		bootstrap: []string{"8.8.8.8"},
 	}, {
-		// Cloudflare DNS (DoH)
+		// Cloudflare DNS (DNS-over-HTTPS)
+		bootstrap: googleRslv,
 		address:   "sdns://AgcAAAAAAAAABzEuMC4wLjGgENk8mGSlIfMGXMOlIlCcKvq7AVgcrZxtjon911-ep0cg63Ul-I8NlFj4GplQGb_TTLiczclX57DvMV8Q-JdjgRgSZG5zLmNsb3VkZmxhcmUuY29tCi9kbnMtcXVlcnk",
-		bootstrap: []string{"8.8.8.8:53"},
 	}, {
 		// Google (Plain)
+		bootstrap: nil,
 		address:   "sdns://AAcAAAAAAAAABzguOC44Ljg",
-		bootstrap: []string{},
 	}, {
 		// AdGuard DNS (DNS-over-TLS)
+		bootstrap: googleRslv,
 		address:   "sdns://AwAAAAAAAAAAAAAPZG5zLmFkZ3VhcmQuY29t",
-		bootstrap: []string{"8.8.8.8:53"},
 	}, {
 		// AdGuard DNS (DNS-over-QUIC)
-		address:   "sdns://BAcAAAAAAAAAAAATZG5zLmFkZ3VhcmQuY29tOjc4NA",
-		bootstrap: []string{"8.8.8.8:53"},
+		bootstrap: googleRslv,
+		address:   "sdns://BAcAAAAAAAAAAAAXZG5zLmFkZ3VhcmQtZG5zLmNvbTo3ODQ",
 	}, {
-		// Cloudflare DNS
+		// Cloudflare DNS (DNS-over-HTTPS)
+		bootstrap: nil,
 		address:   "https://1.1.1.1/dns-query",
-		bootstrap: []string{},
 	}, {
-		// Cloudflare DNS
-		address:   "quic://dns-unfiltered.adguard.com:784",
-		bootstrap: []string{},
+		// AdGuard DNS (DNS-over-QUIC)
+		bootstrap: googleRslv,
+		address:   "quic://dns.adguard-dns.com",
 	}, {
 		// Google DNS (HTTP3)
+		bootstrap: nil,
 		address:   "h3://dns.google/dns-query",
-		bootstrap: []string{},
 	}}
+
 	for _, test := range upstreams {
 		t.Run(test.address, func(t *testing.T) {
-			u, err := AddressToUpstream(
+			u, upsErr := AddressToUpstream(
 				test.address,
 				&Options{Bootstrap: test.bootstrap, Timeout: timeout},
 			)
-			require.NoErrorf(t, err, "failed to generate upstream from address %s", test.address)
+			require.NoErrorf(t, upsErr, "failed to generate upstream from address %s", test.address)
 			testutil.CleanupAndRequireSuccess(t, u.Close)
 
 			checkUpstream(t, u, test.address)
@@ -195,7 +212,10 @@ func TestUpstreams(t *testing.T) {
 }
 
 func TestAddressToUpstream(t *testing.T) {
-	opt := &Options{Bootstrap: []string{"1.1.1.1"}}
+	cloudflareRslv, err := NewUpstreamResolver("1.1.1.1", nil)
+	require.NoError(t, err)
+
+	opt := &Options{Bootstrap: cloudflareRslv}
 
 	testCases := []struct {
 		addr string
@@ -233,8 +253,8 @@ func TestAddressToUpstream(t *testing.T) {
 
 	for _, tc := range testCases {
 		t.Run(tc.addr, func(t *testing.T) {
-			u, err := AddressToUpstream(tc.addr, tc.opt)
-			require.NoError(t, err)
+			u, upsErr := AddressToUpstream(tc.addr, tc.opt)
+			require.NoError(t, upsErr)
 			testutil.CleanupAndRequireSuccess(t, u.Close)
 
 			assert.Equal(t, tc.want, u.Address())
@@ -250,14 +270,16 @@ func TestAddressToUpstream_bads(t *testing.T) {
 		addr:       "asdf://1.1.1.1",
 		wantErrMsg: "unsupported url scheme: asdf",
 	}, {
-		addr:       "12345.1.1.1:1234567",
-		wantErrMsg: "invalid address: 12345.1.1.1:1234567",
+		addr: "12345.1.1.1:1234567",
+		wantErrMsg: `invalid address 12345.1.1.1:1234567: ` +
+			`strconv.ParseUint: parsing "1234567": value out of range`,
 	}, {
-		addr:       ":1234567",
-		wantErrMsg: "invalid address: :1234567",
+		addr: ":1234567",
+		wantErrMsg: `invalid address :1234567: ` +
+			`strconv.ParseUint: parsing "1234567": value out of range`,
 	}, {
 		addr:       "host:",
-		wantErrMsg: "invalid address: host:",
+		wantErrMsg: `invalid address host:: strconv.ParseUint: parsing "": invalid syntax`,
 	}}
 
 	for _, tc := range testCases {
@@ -271,23 +293,28 @@ func TestAddressToUpstream_bads(t *testing.T) {
 func TestUpstreamDoTBootstrap(t *testing.T) {
 	upstreams := []struct {
 		address   string
-		bootstrap []string
+		bootstrap string
 	}{{
 		address:   "tls://one.one.one.one/",
-		bootstrap: []string{"tls://1.1.1.1"},
+		bootstrap: "tls://1.1.1.1",
 	}, {
 		address:   "tls://one.one.one.one/",
-		bootstrap: []string{"https://1.1.1.1/dns-query"},
+		bootstrap: "https://1.1.1.1/dns-query",
 	}, {
 		address: "tls://one.one.one.one/",
 		// Cisco OpenDNS
-		bootstrap: []string{"sdns://AQAAAAAAAAAADjIwOC42Ny4yMjAuMjIwILc1EUAgbyJdPivYItf9aR6hwzzI1maNDL4Ev6vKQ_t5GzIuZG5zY3J5cHQtY2VydC5vcGVuZG5zLmNvbQ"},
+		bootstrap: "sdns://AQAAAAAAAAAADjIwOC42Ny4yMjAuMjIwILc1EUAgbyJdPivYItf9aR6hwzzI1maNDL4Ev6vKQ_t5GzIuZG5zY3J5cHQtY2VydC5vcGVuZG5zLmNvbQ",
 	}}
 
 	for _, tc := range upstreams {
 		t.Run(tc.address, func(t *testing.T) {
+			rslv, err := NewUpstreamResolver(tc.bootstrap, &Options{
+				Timeout: timeout,
+			})
+			require.NoError(t, err)
+
 			u, err := AddressToUpstream(tc.address, &Options{
-				Bootstrap: tc.bootstrap,
+				Bootstrap: rslv,
 				Timeout:   timeout,
 			})
 			require.NoErrorf(t, err, "failed to generate upstream from address %s", tc.address)
@@ -327,8 +354,18 @@ func TestUpstreamsInvalidBootstrap(t *testing.T) {
 
 	for _, tc := range upstreams {
 		t.Run(tc.address, func(t *testing.T) {
+			var rslv ConsequentResolver
+			for _, b := range tc.bootstrap {
+				r, err := NewUpstreamResolver(b, &Options{
+					Timeout: timeout,
+				})
+				require.NoError(t, err)
+
+				rslv = append(rslv, r)
+			}
+
 			u, err := AddressToUpstream(tc.address, &Options{
-				Bootstrap: tc.bootstrap,
+				Bootstrap: rslv,
 				Timeout:   timeout,
 			})
 			require.NoErrorf(t, err, "failed to generate upstream from address %s", tc.address)
@@ -338,54 +375,71 @@ func TestUpstreamsInvalidBootstrap(t *testing.T) {
 		})
 	}
 
-	_, err := AddressToUpstream("tls://example.org", &Options{
-		Bootstrap: []string{"8.8.8.8", "asdfasdf"},
+	t.Run("bad_bootstrap", func(t *testing.T) {
+		_, err := NewUpstreamResolver("asdfasdf", nil)
+		assert.Error(t, err) // bad bootstrap "asdfasdf"
 	})
-	assert.Error(t, err) // bad bootstrap "asdfasdf"
 }
 
-func TestUpstreamsWithServerIP(t *testing.T) {
-	// use invalid bootstrap to make sure it fails if tries to use it
-	invalidBootstrap := []string{"1.2.3.4:55"}
+func TestAddressToUpstream_StaticResolver(t *testing.T) {
+	h := func(w dns.ResponseWriter, m *dns.Msg) {
+		require.NoError(testutil.PanicT{}, w.WriteMsg(respondToTestMessage(m)))
+	}
+	dotSrv := startDoTServer(t, h)
+	dohSrv := startDoHServer(t, testDoHServerOptions{})
+	_, dohPort, err := net.SplitHostPort(dohSrv.addr)
+	require.NoError(t, err)
+
+	badResolver := &UpstreamResolver{Upstream: nil}
+
+	dotStamp := (&dnsstamps.ServerStamp{
+		ServerAddrStr: netip.AddrPortFrom(netutil.IPv4Localhost(), uint16(dotSrv.port)).String(),
+		Proto:         dnsstamps.StampProtoTypeTLS,
+		ProviderName:  netip.AddrPortFrom(netutil.IPv4Localhost(), uint16(dotSrv.port)).String(),
+	}).String()
+	dohStamp := (&dnsstamps.ServerStamp{
+		ServerAddrStr: dohSrv.addr,
+		Proto:         dnsstamps.StampProtoTypeDoH,
+		ProviderName:  dohSrv.addr,
+		Path:          "/dns-query",
+	}).String()
 
 	upstreams := []struct {
-		address   string
-		serverIP  net.IP
-		bootstrap []string
+		rslv    Resolver
+		name    string
+		address string
 	}{{
-		address:   "tls://dns.adguard.com",
-		serverIP:  net.IP{94, 140, 14, 14},
-		bootstrap: invalidBootstrap,
+		rslv:    StaticResolver{netutil.IPv4Localhost()},
+		name:    "dot",
+		address: fmt.Sprintf("tls://some.dns.server:%d", dotSrv.port),
 	}, {
-		address:   "https://dns.adguard.com/dns-query",
-		serverIP:  net.IP{94, 140, 14, 14},
-		bootstrap: invalidBootstrap,
+		rslv:    StaticResolver{netutil.IPv4Localhost()},
+		name:    "doh",
+		address: fmt.Sprintf("https://some.dns.server:%s/dns-query", dohPort),
 	}, {
-		// AdGuard DNS DoH with the IP address specified.
-		address:   "sdns://AgcAAAAAAAAADzE3Ni4xMDMuMTMwLjEzMAAPZG5zLmFkZ3VhcmQuY29tCi9kbnMtcXVlcnk",
-		serverIP:  nil,
-		bootstrap: invalidBootstrap,
+		rslv:    badResolver,
+		name:    "dot_stamp",
+		address: dotStamp,
 	}, {
-		// AdGuard DNS DoT with the IP address specified.
-		address:   "sdns://AwAAAAAAAAAAEzE3Ni4xMDMuMTMwLjEzMDo4NTMAD2Rucy5hZGd1YXJkLmNvbQ",
-		serverIP:  nil,
-		bootstrap: invalidBootstrap,
+		rslv:    badResolver,
+		name:    "doh_stamp",
+		address: dohStamp,
 	}}
 
 	for _, tc := range upstreams {
-		opts := &Options{
-			Bootstrap:     tc.bootstrap,
-			Timeout:       timeout,
-			ServerIPAddrs: []net.IP{tc.serverIP},
-		}
-		u, err := AddressToUpstream(tc.address, opts)
-		if err != nil {
-			t.Fatalf("Failed to generate upstream from address %s: %s", tc.address, err)
-		}
-		testutil.CleanupAndRequireSuccess(t, u.Close)
+		t.Run(tc.name, func(t *testing.T) {
+			opts := &Options{
+				Bootstrap:          tc.rslv,
+				Timeout:            timeout,
+				InsecureSkipVerify: true,
+			}
+			u, uErr := AddressToUpstream(tc.address, opts)
+			require.NoError(t, uErr)
+			testutil.CleanupAndRequireSuccess(t, u.Close)
 
-		t.Run(tc.address, func(t *testing.T) {
-			checkUpstream(t, u, tc.address)
+			assert.NotPanics(t, func() {
+				checkUpstream(t, u, tc.address)
+			})
 		})
 	}
 }
@@ -395,7 +449,7 @@ func TestAddPort(t *testing.T) {
 		name string
 		want string
 		host string
-		port int
+		port uint16
 	}{{
 		name: "empty",
 		want: ":0",
@@ -414,6 +468,11 @@ func TestAddPort(t *testing.T) {
 	}, {
 		name: "ipv6",
 		want: "[::1]:1",
+		host: "::1",
+		port: 1,
+	}, {
+		name: "ipv6_with_brackets",
+		want: "[::1]:1",
 		host: "[::1]",
 		port: 1,
 	}, {
@@ -427,7 +486,7 @@ func TestAddPort(t *testing.T) {
 		host: "1.2.3.4:2",
 		port: 1,
 	}, {
-		name: "ipv6_with_port",
+		name: "ipv6_with_brackets_and_port",
 		want: "[::1]:2",
 		host: "[::1]:2",
 		port: 1,
@@ -541,15 +600,15 @@ func requireResponse(t require.TestingT, req, reply *dns.Msg) {
 // root certificate pem-encoded.
 // TODO(ameshkov): start using rootCAs in tests instead of InsecureVerify.
 func createServerTLSConfig(
-	t *testing.T,
+	tb testing.TB,
 	tlsServerName string,
 ) (tlsConfig *tls.Config, rootCAs *x509.CertPool) {
 	privateKey, err := rsa.GenerateKey(rand.Reader, 2048)
-	require.NoError(t, err)
+	require.NoError(tb, err)
 
 	serialNumberLimit := new(big.Int).Lsh(big.NewInt(1), 128)
 	serialNumber, err := rand.Int(rand.Reader, serialNumberLimit)
-	require.NoError(t, err)
+	require.NoError(tb, err)
 
 	notBefore := time.Now()
 	notAfter := notBefore.Add(5 * 365 * time.Hour * 24)
@@ -576,7 +635,7 @@ func createServerTLSConfig(
 		publicKey(privateKey),
 		privateKey,
 	)
-	require.NoError(t, err)
+	require.NoError(tb, err)
 
 	certPem := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: derBytes})
 	keyPem := pem.EncodeToMemory(
@@ -587,7 +646,7 @@ func createServerTLSConfig(
 	)
 
 	cert, err := tls.X509KeyPair(certPem, keyPem)
-	require.NoError(t, err)
+	require.NoError(tb, err)
 
 	rootCAs = x509.NewCertPool()
 	rootCAs.AppendCertsFromPEM(certPem)

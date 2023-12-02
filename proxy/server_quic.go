@@ -3,7 +3,6 @@ package proxy
 import (
 	"context"
 	"encoding/binary"
-	"errors"
 	"fmt"
 	"io"
 	"math"
@@ -11,10 +10,12 @@ import (
 	"time"
 
 	"github.com/AdguardTeam/dnsproxy/proxyutil"
+	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/golibs/netutil"
 	"github.com/bluele/gcache"
-	"github.com/lucas-clemente/quic-go"
 	"github.com/miekg/dns"
+	"github.com/quic-go/quic-go"
 )
 
 // NextProtoDQ is the ALPN token for DoQ. During connection establishment,
@@ -82,16 +83,15 @@ func (p *Proxy) createQUICListeners() error {
 // quicPacketLoop listens for incoming QUIC packets.
 //
 // See also the comment on Proxy.requestGoroutinesSema.
-func (p *Proxy) quicPacketLoop(l quic.EarlyListener, requestGoroutinesSema semaphore) {
+func (p *Proxy) quicPacketLoop(l *quic.EarlyListener, requestGoroutinesSema semaphore) {
 	log.Info("Entering the DNS-over-QUIC listener loop on %s", l.Addr())
 	for {
 		conn, err := l.Accept(context.Background())
-
 		if err != nil {
-			if isQUICNonCrit(err) {
-				log.Tracef("quic connection closed or timed out: %s", err)
+			if isQUICErrorForDebugLog(err) {
+				log.Debug("accepting quic conn: closed or timed out: %s", err)
 			} else {
-				log.Error("reading from quic listen: %s", err)
+				log.Error("accepting quic conn: %s", err)
 			}
 
 			break
@@ -118,10 +118,10 @@ func (p *Proxy) handleQUICConnection(conn quic.Connection, requestGoroutinesSema
 		// bidirectional stream.
 		stream, err := conn.AcceptStream(context.Background())
 		if err != nil {
-			if isQUICNonCrit(err) {
-				log.Tracef("quic connection closed or timeout: %s", err)
+			if isQUICErrorForDebugLog(err) {
+				log.Debug("accepting quic stream: closed or timed out: %s", err)
 			} else {
-				log.Info("got error when accepting a new QUIC stream: %s", err)
+				log.Error("accepting quic stream: %s", err)
 			}
 
 			// Close the connection to make sure resources are freed.
@@ -158,7 +158,7 @@ func (p *Proxy) handleQUICStream(stream quic.Stream, conn quic.Connection) {
 	// indicated as error here.  Instead, we should check the number of bytes
 	// received.
 	buf := *bufPtr
-	n, err := stream.Read(buf)
+	n, err := readAll(stream, buf)
 
 	// Note that io.EOF does not really mean that there's any error, this is
 	// just a signal that there will be no data to read anymore from this
@@ -204,7 +204,7 @@ func (p *Proxy) handleQUICStream(stream quic.Stream, conn quic.Connection) {
 	}
 
 	d := p.newDNSContext(ProtoQUIC, req)
-	d.Addr = conn.RemoteAddr()
+	d.Addr = netutil.NetAddrToAddrPort(conn.RemoteAddr())
 	d.QUICStream = stream
 	d.QUICConnection = conn
 	d.DoQVersion = doqVersion
@@ -223,7 +223,7 @@ func (p *Proxy) respondQUIC(d *DNSContext) error {
 		// If no response has been written, close the QUIC connection now.
 		closeQUICConn(d.QUICConnection, DoQCodeInternalError)
 
-		return errors.New("no response to write")
+		return errors.Error("no response to write")
 	}
 
 	bytes, err := resp.Pack()
@@ -310,21 +310,28 @@ func logShortQUICRead(err error) {
 		return
 	}
 
-	if isQUICNonCrit(err) {
-		log.Tracef("quic connection closed or timeout: %s", err)
+	if isQUICErrorForDebugLog(err) {
+		log.Debug("reading from quic stream: closed or timeout: %s", err)
 	} else {
 		log.Error("reading from quic stream: %s", err)
 	}
 }
 
-// isQUICNonCrit returns true if err is a non-critical error, most probably
-// related to the current QUIC implementation.
-// TODO(ameshkov): re-test when updating quic-go.
-func isQUICNonCrit(err error) (ok bool) {
-	if err == nil {
-		return false
-	}
+const (
+	// qCodeNoError is returned when the QUIC connection was gracefully closed
+	// and there is no error to signal.
+	qCodeNoError = quic.ApplicationErrorCode(quic.NoError)
 
+	// qCodeApplicationErrorError is used for Initial and Handshake packets.
+	// This error is considered as non-critical and will not be logged as error.
+	qCodeApplicationErrorError = quic.ApplicationErrorCode(quic.ApplicationErrorErrorCode)
+)
+
+// isQUICErrorForDebugLog returns true if err is a non-critical error, most probably
+// related to the current QUIC implementation. err must not be nil.
+//
+// TODO(ameshkov): re-test when updating quic-go.
+func isQUICErrorForDebugLog(err error) (ok bool) {
 	if errors.Is(err, quic.ErrServerClosed) {
 		// This error is returned when the QUIC listener was closed by us. This
 		// is an expected error, we don't need the detailed logs here.
@@ -332,9 +339,11 @@ func isQUICNonCrit(err error) (ok bool) {
 	}
 
 	var qAppErr *quic.ApplicationError
-	if errors.As(err, &qAppErr) && qAppErr.ErrorCode == 0 {
-		// This error is returned when a QUIC connection was gracefully closed.
-		// No need to have detailed logs for it either.
+	if errors.As(err, &qAppErr) &&
+		(qAppErr.ErrorCode == qCodeNoError || qAppErr.ErrorCode == qCodeApplicationErrorError) {
+		// No need to have detailed logs for these error codes either.
+		//
+		// TODO(a.garipov): Consider adding other error codes.
 		return true
 	}
 
@@ -345,22 +354,21 @@ func isQUICNonCrit(err error) (ok bool) {
 		return true
 	}
 
+	// This error is returned when we're trying to accept a new stream from a
+	// connection that had no activity for over than the keep-alive timeout.
+	// This is a common scenario, no need for extra logs.
 	var qIdleErr *quic.IdleTimeoutError
-	if errors.As(err, &qIdleErr) {
-		// This error is returned when we're trying to accept a new stream from
-		// a connection that had no activity for over than the keep-alive
-		// timeout.  This is a common scenario, no need for extra logs.
-		return true
-	}
 
-	return false
+	return errors.As(err, &qIdleErr)
 }
 
 // closeQUICConn quietly closes the QUIC connection.
 func closeQUICConn(conn quic.Connection, code quic.ApplicationErrorCode) {
+	log.Debug("closing quic conn %s with code %d", conn.LocalAddr(), code)
+
 	err := conn.CloseWithError(code, "")
 	if err != nil {
-		log.Debug("failed to close QUIC connection: %v", err)
+		log.Debug("closing quic connection with code %d: %s", code, err)
 	}
 }
 
@@ -371,9 +379,11 @@ func newServerQUICConfig() (conf *quic.Config) {
 
 	return &quic.Config{
 		MaxIdleTimeout:           maxQUICIdleTimeout,
-		RequireAddressValidation: v.requiresValidation,
 		MaxIncomingStreams:       math.MaxUint16,
 		MaxIncomingUniStreams:    math.MaxUint16,
+		RequireAddressValidation: v.requiresValidation,
+		// Enable 0-RTT by default for all connections on the server-side.
+		Allow0RTT: true,
 	}
 }
 
@@ -411,4 +421,30 @@ func (v *quicAddrValidator) requiresValidation(addr net.Addr) (ok bool) {
 	// Address not found in the cache so return true to make sure the server
 	// will require address validation.
 	return true
+}
+
+// readAll reads from r until an error or io.EOF into the specified buffer buf.
+// A successful call returns err == nil, not err == io.EOF.  If the buffer is
+// too small, it returns error io.ErrShortBuffer.  This function has some
+// similarities to io.ReadAll, but it reads to the specified buffer and not
+// allocates (and grows) a new one.  Also, it is completely different from
+// io.ReadFull as that one reads the exact number of bytes (buffer length) and
+// readAll reads until io.EOF or until the buffer is filled.
+func readAll(r io.Reader, buf []byte) (n int, err error) {
+	for {
+		if n == len(buf) {
+			return n, io.ErrShortBuffer
+		}
+
+		var read int
+		read, err = r.Read(buf[n:])
+		n += read
+
+		if err != nil {
+			if err == io.EOF {
+				err = nil
+			}
+			return n, err
+		}
+	}
 }

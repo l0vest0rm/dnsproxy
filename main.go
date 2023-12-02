@@ -1,3 +1,4 @@
+// Package main is responsible for command-line interface of dnsproxy.
 package main
 
 import (
@@ -6,16 +7,23 @@ import (
 	"net"
 	"net/http"
 	"net/http/pprof"
+	"net/netip"
+	"net/url"
 	"os"
 	"os/signal"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/AdguardTeam/dnsproxy/internal/bootstrap"
+	proxynetutil "github.com/AdguardTeam/dnsproxy/internal/netutil"
+	"github.com/AdguardTeam/dnsproxy/internal/osutil"
+	"github.com/AdguardTeam/dnsproxy/internal/version"
 	"github.com/AdguardTeam/dnsproxy/proxy"
 	"github.com/AdguardTeam/dnsproxy/upstream"
 	"github.com/AdguardTeam/golibs/log"
-	"github.com/AdguardTeam/golibs/netutil"
+	"github.com/AdguardTeam/golibs/mathutil"
+	"github.com/AdguardTeam/golibs/timeutil"
 	"github.com/ameshkov/dnscrypt/v2"
 	goFlags "github.com/jessevdk/go-flags"
 	"gopkg.in/yaml.v3"
@@ -24,8 +32,9 @@ import (
 // Options represents console arguments.  For further additions, please do not
 // use the default option since it will cause some problems when config files
 // are used.
+//
+// TODO(a.garipov): Consider extracting conf blocks for better fieldalignment.
 type Options struct {
-
 	// Configuration file path (yaml), the config path should be read without
 	// using goFlags in order not to have default values overriding yaml
 	// options.
@@ -73,7 +82,7 @@ type Options struct {
 	// Minimum TLS version
 	TLSMinVersion float32 `yaml:"tls-min-version" long:"tls-min-version" description:"Minimum TLS version, for example 1.0" optional:"yes"`
 
-	// Minimum TLS version
+	// Maximum TLS version
 	TLSMaxVersion float32 `yaml:"tls-max-version" long:"tls-max-version" description:"Maximum TLS version, for example 1.3" optional:"yes"`
 
 	// Disable TLS certificate verification
@@ -93,10 +102,14 @@ type Options struct {
 	Upstreams []string `yaml:"upstream" short:"u" long:"upstream" description:"An upstream to be used (can be specified multiple times). You can also specify path to a file with the list of servers" optional:"false"`
 
 	// Bootstrap DNS
-	BootstrapDNS []string `yaml:"bootstrap" short:"b" long:"bootstrap" description:"Bootstrap DNS for DoH and DoT, can be specified multiple times (default: 8.8.8.8:53)"`
+	BootstrapDNS []string `yaml:"bootstrap" short:"b" long:"bootstrap" description:"Bootstrap DNS for DoH and DoT, can be specified multiple times (default: use system-provided)"`
 
 	// Fallback DNS resolver
 	Fallbacks []string `yaml:"fallback" short:"f" long:"fallback" description:"Fallback resolvers to use when regular ones are unavailable, can be specified multiple times. You can also specify path to a file with the list of servers"`
+
+	// PrivateRDNSUpstreams are upstreams to use for reverse DNS lookups of
+	// private addresses.
+	PrivateRDNSUpstreams []string `yaml:"private-rdns-upstream" long:"private-rdns-upstream" description:"Private DNS upstreams to use for reverse DNS lookups of private addresses, can be specified multiple times"`
 
 	// If true, parallel queries to all configured upstream servers
 	AllServers bool `yaml:"all-servers" long:"all-servers" description:"If specified, parallel queries to all configured upstream servers are enabled" optional:"yes" optional-value:"true"`
@@ -104,6 +117,10 @@ type Options struct {
 	// Respond to A or AAAA requests only with the fastest IP address
 	//  detected by ICMP response time or TCP connection time
 	FastestAddress bool `yaml:"fastest-addr" long:"fastest-addr" description:"Respond to A or AAAA requests only with the fastest IP address" optional:"yes" optional-value:"true"`
+
+	// Timeout for outbound DNS queries to remote upstream servers in a
+	// human-readable form.  Default is 10s.
+	Timeout timeutil.Duration `yaml:"timeout" long:"timeout" description:"Timeout for outbound DNS queries to remote upstream servers in a human-readable form" default:"10s"`
 
 	// Cache settings
 	// --
@@ -129,6 +146,14 @@ type Options struct {
 	// Ratelimit value
 	Ratelimit int `yaml:"ratelimit" short:"r" long:"ratelimit" description:"Ratelimit (requests per second)"`
 
+	// RatelimitSubnetLenIPv4 is a subnet length for IPv4 addresses used for
+	// rate limiting requests
+	RatelimitSubnetLenIPv4 int `yaml:"ratelimit-subnet-len-ipv4" long:"ratelimit-subnet-len-ipv4" description:"Ratelimit subnet length for IPv4." default:"24"`
+
+	// RatelimitSubnetLenIPv6 is a subnet length for IPv6 addresses used for
+	// rate limiting requests
+	RatelimitSubnetLenIPv6 int `yaml:"ratelimit-subnet-len-ipv6" long:"ratelimit-subnet-len-ipv6" description:"Ratelimit subnet length for IPv6." default:"56"`
+
 	// If true, refuse ANY requests
 	RefuseAny bool `yaml:"refuse-any" long:"refuse-any" description:"If specified, refuse ANY requests" optional:"yes" optional-value:"true"`
 
@@ -147,11 +172,21 @@ type Options struct {
 	// Defines whether DNS64 functionality is enabled or not
 	DNS64 bool `yaml:"dns64" long:"dns64" description:"If specified, dnsproxy will act as a DNS64 server" optional:"yes" optional-value:"true"`
 
-	// DNS64Prefix defines the DNS64 prefix that dnsproxy should use when it acts as a DNS64 server
-	DNS64Prefix string `yaml:"dns64-prefix" long:"dns64-prefix" description:"If specified, this is the DNS64 prefix dnsproxy will be using when it works as a DNS64 server. If not specified, dnsproxy uses the 'Well-Known Prefix' 64:ff9b::" required:"false"`
+	// DNS64Prefix defines the DNS64 prefixes that dnsproxy should use when it
+	// acts as a DNS64 server.  If not specified, dnsproxy uses the default
+	// Well-Known Prefix.  This option can be specified multiple times.
+	DNS64Prefix []string `yaml:"dns64-prefix" long:"dns64-prefix" description:"Prefix used to handle DNS64. If not specified, dnsproxy uses the 'Well-Known Prefix' 64:ff9b::.  Can be specified multiple times" required:"false"`
 
 	// Other settings and options
 	// --
+
+	// Set Server header for the HTTPS server
+	HTTPSServerName string `yaml:"https-server-name" long:"https-server-name" description:"Set the Server header for the responses from the HTTPS server." default:"dnsproxy"`
+
+	// HTTPSUserinfo is the sole permitted userinfo for the DoH basic
+	// authentication.  If it is set, all DoH queries are required to have this
+	// basic authentication information.
+	HTTPSUserinfo string `yaml:"https-userinfo" long:"https-userinfo" description:"If set, all DoH queries are required to have this basic authentication information."`
 
 	// If true, all AAAA requests will be replied with NoError RCode and empty answer
 	IPv6Disabled bool `yaml:"ipv6-disabled" long:"ipv6-disabled" description:"If specified, all AAAA requests will be replied with NoError RCode and empty answer" optional:"yes" optional-value:"true"`
@@ -173,21 +208,17 @@ type Options struct {
 	Version bool `yaml:"version" long:"version" description:"Prints the program version"`
 }
 
-// VersionString will be set through ldflags, contains current version
-var VersionString = "dev" // nolint:gochecknoglobals
-
-const defaultTimeout = 10 * time.Second
-
-// defaultDNS64Prefix is a so-called "Well-Known Prefix" for DNS64.
-// if dnsproxy operates as a DNS64 server, we'll be using it.
-const defaultDNS64Prefix = "64:ff9b::/96"
+const (
+	defaultLocalTimeout = 1 * time.Second
+)
 
 func main() {
 	options := &Options{}
 
 	for _, arg := range os.Args {
 		if arg == "--version" {
-			fmt.Printf("dnsproxy version: %s\n", VersionString)
+			fmt.Printf("dnsproxy version: %s\n", version.Version())
+
 			os.Exit(0)
 		}
 
@@ -215,10 +246,11 @@ func main() {
 	if err != nil {
 		if flagsErr, ok := err.(*goFlags.Error); ok && flagsErr.Type == goFlags.ErrHelp {
 			os.Exit(0)
-		} else {
-			os.Exit(1)
 		}
+
+		os.Exit(1)
 	}
+
 	run(options)
 }
 
@@ -227,24 +259,24 @@ func run(options *Options) {
 		log.SetLevel(log.DEBUG)
 	}
 	if options.LogOutput != "" {
+		// #nosec G302 -- Trust the file path that is given in the
+		// configuration.
 		file, err := os.OpenFile(options.LogOutput, os.O_WRONLY|os.O_CREATE|os.O_APPEND, 0o644)
 		if err != nil {
 			log.Fatalf("cannot create a log file: %s", err)
 		}
-		defer file.Close() //nolint
+
+		defer func() { _ = file.Close() }()
 		log.SetOutput(file)
 	}
 
 	runPprof(options)
 
-	log.Info("Starting dnsproxy %s", VersionString)
+	log.Info("Starting dnsproxy %s", version.Version())
 
 	// Prepare the proxy server and its configuration.
-	config := createProxyConfig(options)
-	dnsProxy := &proxy.Proxy{Config: config}
-
-	// Init DNS64 if needed.
-	initDNS64(dnsProxy, options)
+	conf := createProxyConfig(options)
+	dnsProxy := &proxy.Proxy{Config: conf}
 
 	// Add extra handler if needed.
 	if options.IPv6Disabled {
@@ -301,9 +333,11 @@ func runPprof(options *Options) {
 }
 
 // createProxyConfig creates proxy.Config from the command line arguments
-func createProxyConfig(options *Options) proxy.Config {
-	// Create the config
-	config := proxy.Config{
+func createProxyConfig(options *Options) (conf proxy.Config) {
+	conf = proxy.Config{
+		RatelimitSubnetLenIPv4: options.RatelimitSubnetLenIPv4,
+		RatelimitSubnetLenIPv6: options.RatelimitSubnetLenIPv6,
+
 		Ratelimit:       options.Ratelimit,
 		CacheEnabled:    options.Cache,
 		CacheSizeBytes:  options.CacheSizeBytes,
@@ -318,23 +352,45 @@ func createProxyConfig(options *Options) proxy.Config {
 		TrustedProxies:         []string{"0.0.0.0/0", "::0/0"},
 		EnableEDNSClientSubnet: options.EnableEDNSSubnet,
 		UDPBufferSize:          options.UDPBufferSize,
+		HTTPSServerName:        options.HTTPSServerName,
 		MaxGoroutines:          options.MaxGoRoutines,
 	}
 
-	initUpstreams(&config, options)
-	initEDNS(&config, options)
-	initBogusNXDomain(&config, options)
-	initTLSConfig(&config, options)
-	initDNSCryptConfig(&config, options)
-	initListenAddrs(&config, options)
+	if uiStr := options.HTTPSUserinfo; uiStr != "" {
+		user, pass, ok := strings.Cut(uiStr, ":")
+		if ok {
+			conf.Userinfo = url.UserPassword(user, pass)
+		} else {
+			conf.Userinfo = url.User(user)
+		}
+	}
 
-	return config
+	// TODO(e.burkov):  Make these methods of [Options].
+	initUpstreams(&conf, options)
+	initEDNS(&conf, options)
+	initBogusNXDomain(&conf, options)
+	initTLSConfig(&conf, options)
+	initDNSCryptConfig(&conf, options)
+	initListenAddrs(&conf, options)
+	initDNS64(&conf, options)
+
+	return conf
+}
+
+// isEmpty returns false if uc contains at least a single upstream.  uc must not
+// be nil.
+//
+// TODO(e.burkov):  Think of a better way to validate the config.  Perhaps,
+// return an error from [ParseUpstreamsConfig] if no upstreams were initialized.
+func isEmpty(uc *proxy.UpstreamConfig) (ok bool) {
+	return len(uc.Upstreams) == 0 &&
+		len(uc.DomainReservedUpstreams) == 0 &&
+		len(uc.SpecifiedDomainUpstreams) == 0
 }
 
 // initUpstreams inits upstream-related config
 func initUpstreams(config *proxy.Config, options *Options) {
 	// Init upstreams
-	upstreams := loadServersList(options.Upstreams)
 
 	httpVersions := upstream.DefaultHTTPVersions
 	if options.HTTP3 {
@@ -345,17 +401,54 @@ func initUpstreams(config *proxy.Config, options *Options) {
 		}
 	}
 
+	timeout := options.Timeout.Duration
+	bootOpts := &upstream.Options{
+		HTTPVersions:       httpVersions,
+		InsecureSkipVerify: options.Insecure,
+		Timeout:            timeout,
+	}
+	boot, err := initBootstrap(options.BootstrapDNS, bootOpts)
+	if err != nil {
+		log.Fatalf("error while initializing bootstrap: %s", err)
+	}
+
 	upsOpts := &upstream.Options{
 		HTTPVersions:       httpVersions,
 		InsecureSkipVerify: options.Insecure,
-		Bootstrap:          options.BootstrapDNS,
-		Timeout:            defaultTimeout,
+		Bootstrap:          boot,
+		Timeout:            timeout,
 	}
-	upstreamConfig, err := proxy.ParseUpstreamsConfig(upstreams, upsOpts)
+	upstreams := loadServersList(options.Upstreams)
+
+	config.UpstreamConfig, err = proxy.ParseUpstreamsConfig(upstreams, upsOpts)
 	if err != nil {
 		log.Fatalf("error while parsing upstreams configuration: %s", err)
 	}
-	config.UpstreamConfig = upstreamConfig
+
+	privUpsOpts := &upstream.Options{
+		HTTPVersions: httpVersions,
+		Bootstrap:    boot,
+		Timeout:      mathutil.Min(defaultLocalTimeout, timeout),
+	}
+	privUpstreams := loadServersList(options.PrivateRDNSUpstreams)
+
+	private, err := proxy.ParseUpstreamsConfig(privUpstreams, privUpsOpts)
+	if err != nil {
+		log.Fatalf("error while parsing private rdns upstreams configuration: %s", err)
+	}
+	if !isEmpty(private) {
+		config.PrivateRDNSUpstreamConfig = private
+	}
+
+	fallbackUpstreams := loadServersList(options.Fallbacks)
+	fallbacks, err := proxy.ParseUpstreamsConfig(fallbackUpstreams, upsOpts)
+	if err != nil {
+		log.Fatalf("error while parsing fallback upstreams configuration: %s", err)
+	}
+
+	if !isEmpty(fallbacks) {
+		config.Fallbacks = fallbacks
+	}
 
 	if options.AllServers {
 		config.UpstreamMode = proxy.UModeParallel
@@ -364,23 +457,38 @@ func initUpstreams(config *proxy.Config, options *Options) {
 	} else {
 		config.UpstreamMode = proxy.UModeLoadBalance
 	}
+}
 
-	if options.Fallbacks != nil {
-		fallbacks := []upstream.Upstream{}
-		for i, f := range loadServersList(options.Fallbacks) {
-			// Use the same options for fallback servers as for
-			// upstream servers until it is possible to configure it
-			// separately.
-			//
-			// See https://github.com/AdguardTeam/dnsproxy/issues/161.
-			fallback, err := upstream.AddressToUpstream(f, upsOpts)
-			if err != nil {
-				log.Fatalf("cannot parse the fallback %s (%s): %s", f, options.BootstrapDNS, err)
-			}
-			log.Printf("Fallback %d is %s", i, fallback.Address())
-			fallbacks = append(fallbacks, fallback)
+// initBootstrap initializes the [upstream.Resolver] for bootstrapping upstream
+// servers.  It returns the default resolver if no bootstraps were specified.
+// The returned resolver will also use system hosts files first.
+func initBootstrap(bootstraps []string, opts *upstream.Options) (r upstream.Resolver, err error) {
+	var resolvers []upstream.Resolver
+
+	for i, b := range bootstraps {
+		var resolver upstream.Resolver
+		resolver, err = upstream.NewUpstreamResolver(b, opts)
+		if err != nil {
+			return nil, fmt.Errorf("creating bootstrap resolver at index %d: %w", i, err)
 		}
-		config.Fallbacks = fallbacks
+
+		resolvers = append(resolvers, resolver)
+	}
+
+	switch len(resolvers) {
+	case 0:
+		etcHosts, hostsErr := bootstrap.NewDefaultHostsResolver(osutil.RootDirFS())
+		if hostsErr != nil {
+			log.Error("creating default hosts resolver: %s", hostsErr)
+
+			return net.DefaultResolver, nil
+		}
+
+		return upstream.ConsequentResolver{etcHosts, net.DefaultResolver}, nil
+	case 1:
+		return resolvers[0], nil
+	default:
+		return upstream.ParallelResolver(resolvers), nil
 	}
 }
 
@@ -405,15 +513,13 @@ func initBogusNXDomain(config *proxy.Config, options *Options) {
 		return
 	}
 
-	for _, s := range options.BogusNXDomain {
-		subnet, err := netutil.ParseSubnet(s)
+	for i, s := range options.BogusNXDomain {
+		p, err := proxynetutil.ParseSubnet(s)
 		if err != nil {
-			log.Error("%s", err)
-
-			continue
+			log.Error("parsing bogus nxdomain subnet at index %d: %s", i, err)
+		} else {
+			config.BogusNXDomain = append(config.BogusNXDomain, p)
 		}
-
-		config.BogusNXDomain = append(config.BogusNXDomain, subnet)
 	}
 }
 
@@ -456,7 +562,7 @@ func initDNSCryptConfig(config *proxy.Config, options *Options) {
 
 // initListenAddrs inits listen addrs
 func initListenAddrs(config *proxy.Config, options *Options) {
-	listenIPs := []net.IP{}
+	listenIPs := []netip.Addr{}
 
 	if len(options.ListenAddrs) == 0 {
 		// If ListenAddrs has not been parsed through config file nor command
@@ -470,22 +576,24 @@ func initListenAddrs(config *proxy.Config, options *Options) {
 		options.ListenPorts = []int{53}
 	}
 
-	for _, a := range options.ListenAddrs {
-		ip := net.ParseIP(a)
-		if ip == nil {
-			log.Fatalf("cannot parse %s", a)
+	for i, a := range options.ListenAddrs {
+		ip, err := netip.ParseAddr(a)
+		if err != nil {
+			log.Fatalf("parsing listen address at index %d: %s", i, a)
 		}
+
 		listenIPs = append(listenIPs, ip)
 	}
 
 	if len(options.ListenPorts) != 0 && options.ListenPorts[0] != 0 {
 		for _, port := range options.ListenPorts {
 			for _, ip := range listenIPs {
+				p := uint16(port)
 
-				ua := &net.UDPAddr{Port: port, IP: ip}
+				ua := net.UDPAddrFromAddrPort(netip.AddrPortFrom(ip, p))
 				config.UDPListenAddr = append(config.UDPListenAddr, ua)
 
-				ta := &net.TCPAddr{Port: port, IP: ip}
+				ta := net.TCPAddrFromAddrPort(netip.AddrPortFrom(ip, p))
 				config.TCPListenAddr = append(config.TCPListenAddr, ta)
 			}
 		}
@@ -494,21 +602,21 @@ func initListenAddrs(config *proxy.Config, options *Options) {
 	if config.TLSConfig != nil {
 		for _, port := range options.TLSListenPorts {
 			for _, ip := range listenIPs {
-				a := &net.TCPAddr{Port: port, IP: ip}
+				a := net.TCPAddrFromAddrPort(netip.AddrPortFrom(ip, uint16(port)))
 				config.TLSListenAddr = append(config.TLSListenAddr, a)
 			}
 		}
 
 		for _, port := range options.HTTPSListenPorts {
 			for _, ip := range listenIPs {
-				a := &net.TCPAddr{Port: port, IP: ip}
+				a := net.TCPAddrFromAddrPort(netip.AddrPortFrom(ip, uint16(port)))
 				config.HTTPSListenAddr = append(config.HTTPSListenAddr, a)
 			}
 		}
 
 		for _, port := range options.QUICListenPorts {
 			for _, ip := range listenIPs {
-				a := &net.UDPAddr{Port: port, IP: ip}
+				a := net.UDPAddrFromAddrPort(netip.AddrPortFrom(ip, uint16(port)))
 				config.QUICListenAddr = append(config.QUICListenAddr, a)
 			}
 		}
@@ -517,40 +625,37 @@ func initListenAddrs(config *proxy.Config, options *Options) {
 	if config.DNSCryptResolverCert != nil && config.DNSCryptProviderName != "" {
 		for _, port := range options.DNSCryptListenPorts {
 			for _, ip := range listenIPs {
-				tcp := &net.TCPAddr{Port: port, IP: ip}
+				tcp := net.TCPAddrFromAddrPort(netip.AddrPortFrom(ip, uint16(port)))
 				config.DNSCryptTCPListenAddr = append(config.DNSCryptTCPListenAddr, tcp)
 
-				udp := &net.UDPAddr{Port: port, IP: ip}
+				udp := net.UDPAddrFromAddrPort(netip.AddrPortFrom(ip, uint16(port)))
 				config.DNSCryptUDPListenAddr = append(config.DNSCryptUDPListenAddr, udp)
 			}
 		}
 	}
 }
 
-// initDNS64 inits the DNS64 configuration for dnsproxy
-func initDNS64(p *proxy.Proxy, options *Options) {
-	if !options.DNS64 {
+// initDNS64 sets the DNS64 configuration into conf.
+func initDNS64(conf *proxy.Config, options *Options) {
+	if conf.UseDNS64 = options.DNS64; !conf.UseDNS64 {
 		return
 	}
 
-	dns64Prefix := options.DNS64Prefix
-	if dns64Prefix == "" {
-		dns64Prefix = defaultDNS64Prefix
+	if conf.PrivateRDNSUpstreamConfig == nil || isEmpty(conf.PrivateRDNSUpstreamConfig) {
+		log.Fatalf("at least one private upstream must be configured to use dns64")
 	}
 
-	// DNS64 prefix may be specified as a CIDR: "64:ff9b::/96"
-	ip, _, err := net.ParseCIDR(dns64Prefix)
-	if err != nil {
-		// Or it could be specified as an IP address: "64:ff9b::"
-		ip = net.ParseIP(dns64Prefix)
+	var prefs []netip.Prefix
+	for i, p := range options.DNS64Prefix {
+		pref, err := netip.ParsePrefix(p)
+		if err != nil {
+			log.Fatalf("parsing prefix at index %d: %v", i, err)
+		}
+
+		prefs = append(prefs, pref)
 	}
 
-	if ip == nil || len(ip) < net.IPv6len {
-		log.Fatalf("Invalid DNS64 prefix: %s", dns64Prefix)
-		return
-	}
-
-	p.SetNAT64Prefix(ip[:proxy.NAT64PrefixLength])
+	conf.DNS64Prefs = prefs
 }
 
 // IPv6 configuration
@@ -596,38 +701,48 @@ func newTLSConfig(options *Options) (*tls.Config, error) {
 		return nil, fmt.Errorf("could not load TLS cert: %s", err)
 	}
 
-	return &tls.Config{Certificates: []tls.Certificate{cert}, MinVersion: uint16(tlsMinVersion), MaxVersion: uint16(tlsMaxVersion)}, nil
+	// #nosec G402 -- TLS MinVersion is configured by user.
+	return &tls.Config{
+		Certificates: []tls.Certificate{cert},
+		MinVersion:   uint16(tlsMinVersion),
+		MaxVersion:   uint16(tlsMaxVersion),
+	}, nil
 }
 
-// loadX509KeyPair reads and parses a public/private key pair from a pair
-// of files. The files must contain PEM encoded data. The certificate file
-// may contain intermediate certificates following the leaf certificate to
-// form a certificate chain. On successful return, Certificate.Leaf will
-// be nil because the parsed form of the certificate is not retained.
-func loadX509KeyPair(certFile, keyFile string) (tls.Certificate, error) {
+// loadX509KeyPair reads and parses a public/private key pair from a pair of
+// files.  The files must contain PEM encoded data.  The certificate file may
+// contain intermediate certificates following the leaf certificate to form a
+// certificate chain.  On successful return, Certificate.Leaf will be nil
+// because the parsed form of the certificate is not retained.
+func loadX509KeyPair(certFile, keyFile string) (crt tls.Certificate, err error) {
+	// #nosec G304 -- Trust the file path that is given in the configuration.
 	certPEMBlock, err := os.ReadFile(certFile)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
+
+	// #nosec G304 -- Trust the file path that is given in the configuration.
 	keyPEMBlock, err := os.ReadFile(keyFile)
 	if err != nil {
 		return tls.Certificate{}, err
 	}
+
 	return tls.X509KeyPair(certPEMBlock, keyPEMBlock)
 }
 
-// loadServersList loads a list of DNS servers from the specified list.
-// the thing is that the user may specify either a server address
-// or path to a file with a list of addresses. This method takes care of it,
-// reads the file, loads servers from it if needed.
+// loadServersList loads a list of DNS servers from the specified list.  The
+// thing is that the user may specify either a server address or the path to a
+// file with a list of addresses.  This method takes care of it, it reads the
+// file and loads servers from this file if needed.
 func loadServersList(sources []string) []string {
 	var servers []string
 
 	for _, source := range sources {
+		// #nosec G304 -- Trust the file path that is given in the
+		// configuration.
 		data, err := os.ReadFile(source)
 		if err != nil {
-			// Ignore errors, just consider it a server address
-			// and not a file
+			// Ignore errors, just consider it a server address and not a file.
 			servers = append(servers, source)
 		}
 
@@ -635,7 +750,7 @@ func loadServersList(sources []string) []string {
 		for _, line := range lines {
 			line = strings.TrimSpace(line)
 
-			// Ignore comments in the file
+			// Ignore comments in the file.
 			if line == "" ||
 				strings.HasPrefix(line, "!") ||
 				strings.HasPrefix(line, "#") {

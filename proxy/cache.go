@@ -12,7 +12,9 @@ import (
 	"github.com/AdguardTeam/dnsproxy/upstream"
 	glcache "github.com/AdguardTeam/golibs/cache"
 	"github.com/AdguardTeam/golibs/log"
+	"github.com/AdguardTeam/golibs/mathutil"
 	"github.com/miekg/dns"
+	"golang.org/x/exp/slices"
 )
 
 // defaultCacheSize is the size of cache in bytes by default.
@@ -20,18 +22,18 @@ const defaultCacheSize = 64 * 1024
 
 // cache is used to cache requests and used upstreams.
 type cache struct {
+	// itemsLock protects requests cache.
+	itemsLock *sync.RWMutex
+
+	// itemsWithSubnetLock protects requests cache.
+	itemsWithSubnetLock *sync.RWMutex
+
 	// items is the requests cache.
 	items glcache.Cache
-	// itemsLock protects requests cache.
-	itemsLock sync.RWMutex
 
 	// itemsWithSubnet is the requests cache.
 	itemsWithSubnet glcache.Cache
-	// itemsWithSubnetLock protects requests cache.
-	itemsWithSubnetLock sync.RWMutex
 
-	// cacheSize is the size of a key-value pair of cache.
-	cacheSize int
 	// optimistic defines if the cache should return expired items and resolve
 	// those again.
 	optimistic bool
@@ -162,22 +164,32 @@ func (c *cache) unpackItem(data []byte, req *dns.Msg) (ci *cacheItem, expired bo
 // initCache initializes cache if it's enabled.
 func (p *Proxy) initCache() {
 	if !p.CacheEnabled {
+		log.Info("dnsproxy: cache: disabled")
+
 		return
 	}
 
-	log.Printf("DNS cache is enabled")
+	size := p.CacheSizeBytes
+	log.Info("dnsproxy: cache: enabled, size %d b", size)
 
-	c := &cache{
-		optimistic: p.CacheOptimistic,
-		cacheSize:  p.CacheSizeBytes,
-	}
-	p.cache = c
-	c.initLazy()
-	if p.EnableEDNSClientSubnet {
-		c.initLazyWithSubnet()
-	}
-
+	p.cache = newCache(size, p.EnableEDNSClientSubnet, p.CacheOptimistic)
 	p.shortFlighter = newOptimisticResolver(p)
+}
+
+// newCache returns a properly initialized cache.
+func newCache(size int, withECS, optimistic bool) (c *cache) {
+	c = &cache{
+		itemsLock:           &sync.RWMutex{},
+		itemsWithSubnetLock: &sync.RWMutex{},
+		items:               createCache(size),
+		optimistic:          optimistic,
+	}
+
+	if withECS {
+		c.itemsWithSubnet = createCache(size)
+	}
+
+	return c
 }
 
 // get returns cached item for the req if it's found.  expired is true if the
@@ -204,8 +216,8 @@ func (c *cache) get(req *dns.Msg) (ci *cacheItem, expired bool, key []byte) {
 	return ci, expired, key
 }
 
-// getWithSubnet returns cached item for the req if it's found by n.  expired is
-// true if the item's TTL is expired.  k is the resulting key for req.  It's
+// getWithSubnet returns cached item for the req if it's found by n.  expired
+// is true if the item's TTL is expired.  k is the resulting key for req.  It's
 // returned to avoid recalculating it afterwards.
 //
 // Note that a slow longest-prefix-match algorithm is used, so cache searches
@@ -218,9 +230,38 @@ func (c *cache) getWithSubnet(req *dns.Msg, n *net.IPNet) (ci *cacheItem, expire
 		return nil, false, nil
 	}
 
-	var data []byte
-	for mask, _ := n.Mask.Size(); mask >= 0 && data == nil; mask-- {
-		k = msgToKeyWithSubnet(req, n.IP, mask)
+	ecsIP := n.IP.Mask(n.Mask)
+	ipLen := len(ecsIP)
+	m, _ := n.Mask.Size()
+
+	k = msgToKeyWithSubnet(req, ecsIP, m)
+	data := c.itemsWithSubnet.Get(k)
+
+	// In order to reduce allocations we apply mask on bits level.  As the key
+	// k has ecsIP in bytes slice representation, each iteration we can just
+	// clear one bit in the end of it by applying the bitmask.
+	for bitmask := ^byte(0); m >= 0 && data == nil; m-- {
+		// Set mask identification byte in the key.
+		k[keyMaskIndex] = byte(m)
+
+		// In case mask is zero, the key doesn't have IP in it.
+		if m == 0 {
+			k = slices.Delete(k, keyIPIndex, keyIPIndex+ipLen)
+			data = c.itemsWithSubnet.Get(k)
+
+			continue
+		}
+
+		// Shift or renew bitmask.
+		if m%8 == 0 {
+			bitmask = ^byte(0)
+		} else {
+			bitmask <<= 1
+		}
+
+		// Clear the last non-zero bit in the byte of the IP address.
+		k[keyIPIndex+m/8] &= bitmask
+
 		data = c.itemsWithSubnet.Get(k)
 	}
 
@@ -241,35 +282,15 @@ func canLookUpInCache(cache glcache.Cache, req *dns.Msg) (ok bool) {
 	return cache != nil && req != nil && len(req.Question) == 1
 }
 
-// initLazy initializes the cache for general requests.
-func (c *cache) initLazy() {
-	c.itemsLock.Lock()
-	defer c.itemsLock.Unlock()
-
-	if c.items == nil {
-		c.items = c.createCache()
-	}
-}
-
-// initLazyWithSubnet initializes the cache for requests with subnets.
-func (c *cache) initLazyWithSubnet() {
-	c.itemsWithSubnetLock.Lock()
-	defer c.itemsWithSubnetLock.Unlock()
-
-	if c.itemsWithSubnet == nil {
-		c.itemsWithSubnet = c.createCache()
-	}
-}
-
-// createCache returns new Cache with predefined settings.
-func (c *cache) createCache() (glc glcache.Cache) {
+// createCache returns new Cache with the given cacheSize.
+func createCache(cacheSize int) (glc glcache.Cache) {
 	conf := glcache.Config{
 		MaxSize:   defaultCacheSize,
 		EnableLRU: true,
 	}
 
-	if c.cacheSize > 0 {
-		conf.MaxSize = uint(c.cacheSize)
+	if cacheSize > 0 {
+		conf.MaxSize = uint(cacheSize)
 	}
 
 	return glcache.New(conf)
@@ -281,8 +302,6 @@ func (c *cache) set(m *dns.Msg, u upstream.Upstream) {
 	if item == nil {
 		return
 	}
-
-	c.initLazy()
 
 	key := msgToKey(m)
 	packed := item.pack()
@@ -301,10 +320,8 @@ func (c *cache) setWithSubnet(m *dns.Msg, u upstream.Upstream, subnet *net.IPNet
 		return
 	}
 
-	c.initLazyWithSubnet()
-
 	pref, _ := subnet.Mask.Size()
-	key := msgToKeyWithSubnet(m, subnet.IP, pref)
+	key := msgToKeyWithSubnet(m, subnet.IP.Mask(subnet.Mask), pref)
 	packed := item.pack()
 
 	c.itemsWithSubnetLock.Lock()
@@ -318,19 +335,20 @@ func (c *cache) clearItems() {
 	c.itemsLock.Lock()
 	defer c.itemsLock.Unlock()
 
-	if c.items != nil {
-		c.items.Clear()
-	}
+	c.items.Clear()
 }
 
-// clearItemsWithSubnet empties the subnet cache.
+// clearItemsWithSubnet empties the subnet cache, if any.
 func (c *cache) clearItemsWithSubnet() {
+	if c.itemsWithSubnet == nil {
+		// ECS disabled, return immediately.
+		return
+	}
+
 	c.itemsWithSubnetLock.Lock()
 	defer c.itemsWithSubnetLock.Unlock()
 
-	if c.itemsWithSubnet != nil {
-		c.itemsWithSubnet.Clear()
-	}
+	c.itemsWithSubnet.Clear()
 }
 
 // cacheTTL returns the number of seconds for which m is valid to be cached.
@@ -344,16 +362,18 @@ func cacheTTL(m *dns.Msg) (ttl uint32) {
 	case m == nil:
 		return 0
 	case m.Truncated:
-		log.Tracef("refusing to cache truncated message")
+		log.Debug("dnsproxy: cache: truncated message; not caching")
 
 		return 0
 	case len(m.Question) != 1:
-		log.Tracef("refusing to cache message with wrong number of questions")
+		log.Debug("dnsproxy: cache: message with wrong number of questions; not caching")
 
 		return 0
 	default:
 		ttl = calculateTTL(m)
 		if ttl == 0 {
+			log.Debug("dnsproxy: cache: ttl calculated to be 0; not caching")
+
 			return 0
 		}
 	}
@@ -363,18 +383,18 @@ func cacheTTL(m *dns.Msg) (ttl uint32) {
 		if isCacheableSucceded(m) {
 			return ttl
 		}
+
+		log.Debug("dnsproxy: cache: not a cacheable noerror response; not caching")
 	case dns.RcodeNameError:
 		if isCacheableNegative(m) {
 			return ttl
 		}
+
+		log.Debug("dnsproxy: cache: not a cacheable nxdomain response; not caching")
 	case dns.RcodeServerFailure:
 		return ttl
 	default:
-		log.Tracef(
-			"%s: refusing to cache message with response code %s",
-			m.Question[0].Name,
-			dns.RcodeToString[rcode],
-		)
+		log.Debug("dnsproxy: cache: response code %s; not caching", dns.RcodeToString[rcode])
 	}
 
 	return 0
@@ -393,7 +413,7 @@ func hasIPAns(m *dns.Msg) (ok bool) {
 }
 
 // isCacheableSucceded returns true if m contains useful data to be cached
-// treating it as a succeesful response.
+// treating it as a successful response.
 func isCacheableSucceded(m *dns.Msg) (ok bool) {
 	qType := m.Question[0].Qtype
 
@@ -495,44 +515,47 @@ func msgToKey(m *dns.Msg) (b []byte) {
 	return b
 }
 
+const (
+	// keyMaskIndex is the index of the byte with mask ones value.
+	keyMaskIndex = 1 + 2*packedMsgLenSz
+
+	// keyIPIndex is the start index of the IP address in the key.
+	keyIPIndex = keyMaskIndex + 1
+)
+
 // msgToKeyWithSubnet constructs the cache key from DO bit, type, class, subnet
 // mask, client's IP address and question's name of m.  ecsIP is expected to be
 // masked already.
 func msgToKeyWithSubnet(m *dns.Msg, ecsIP net.IP, mask int) (key []byte) {
 	q := m.Question[0]
-	cap := 1 + 2*packedMsgLenSz + 1 + len(q.Name)
-	ipLen := len(ecsIP)
+	keyLen := keyIPIndex + len(q.Name)
 	masked := mask != 0
 	if masked {
-		cap += ipLen
+		keyLen += len(ecsIP)
 	}
 
 	// Initialize the slice.
-	key = make([]byte, cap)
-	k := 0
+	key = make([]byte, keyLen)
 
 	// Put DO.
-	if opt := m.IsEdns0(); opt != nil && opt.Do() {
-		key[k] = 1
-	} else {
-		key[k] = 0
-	}
-	k++
+	opt := m.IsEdns0()
+	key[0] = mathutil.BoolToNumber[byte](opt != nil && opt.Do())
 
 	// Put Qtype.
+	//
+	// TODO(d.kolyshev): We should put Qtype in key[1:].
 	binary.BigEndian.PutUint16(key[:], q.Qtype)
-	k += packedMsgLenSz
 
 	// Put Qclass.
-	binary.BigEndian.PutUint16(key[k:], q.Qclass)
-	k += packedMsgLenSz
+	binary.BigEndian.PutUint16(key[1+packedMsgLenSz:], q.Qclass)
 
 	// Add mask.
-	key[k] = uint8(mask)
-	k++
+	key[keyMaskIndex] = uint8(mask)
+	k := keyIPIndex
 	if masked {
-		k += copy(key[k:], ecsIP)
+		k += copy(key[keyIPIndex:], ecsIP)
 	}
+
 	copy(key[k:], strings.ToLower(q.Name))
 
 	return key

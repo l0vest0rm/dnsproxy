@@ -1,23 +1,24 @@
 package proxy
 
 import (
+	"context"
 	"fmt"
 	"net"
 	"time"
 
 	"github.com/AdguardTeam/golibs/log"
-	"github.com/lucas-clemente/quic-go"
 	"github.com/miekg/dns"
+	"github.com/quic-go/quic-go"
 )
 
 // startListeners configures and starts listener loops
-func (p *Proxy) startListeners() error {
-	err := p.createUDPListeners()
+func (p *Proxy) startListeners(ctx context.Context) error {
+	err := p.createUDPListeners(ctx)
 	if err != nil {
 		return err
 	}
 
-	err = p.createTCPListeners()
+	err = p.createTCPListeners(ctx)
 	if err != nil {
 		return err
 	}
@@ -59,7 +60,7 @@ func (p *Proxy) startListeners() error {
 	}
 
 	for _, l := range p.h3Listen {
-		go func(l quic.EarlyListener) { _ = p.h3Server.ServeListener(l) }(l)
+		go func(l *quic.EarlyListener) { _ = p.h3Server.ServeListener(l) }(l)
 	}
 
 	for _, l := range p.quicListen {
@@ -79,7 +80,6 @@ func (p *Proxy) startListeners() error {
 
 // handleDNSRequest processes the incoming packet bytes and returns with an optional response packet.
 func (p *Proxy) handleDNSRequest(d *DNSContext) error {
-	d.StartTime = time.Now()
 	p.logDNSMessage(d.Req)
 
 	if d.Req.Response {
@@ -101,7 +101,7 @@ func (p *Proxy) handleDNSRequest(d *DNSContext) error {
 	}
 
 	// ratelimit based on IP only, protects CPU cycles and outbound connections
-	if d.Proto == ProtoUDP && p.isRatelimited(d.Addr) {
+	if d.Proto == ProtoUDP && p.isRatelimited(d.Addr.Addr()) {
 		log.Tracef("Ratelimiting %v based on IP only", d.Addr)
 		return nil // do nothing, don't reply, we got ratelimited
 	}
@@ -147,7 +147,7 @@ func (p *Proxy) handleDNSRequest(d *DNSContext) error {
 func (p *Proxy) respond(d *DNSContext) {
 	// d.Conn can be nil in the case of a DoH request.
 	if d.Conn != nil {
-		d.Conn.SetWriteDeadline(time.Now().Add(defaultTimeout)) //nolint
+		_ = d.Conn.SetWriteDeadline(time.Now().Add(defaultTimeout))
 	}
 
 	var err error
@@ -200,9 +200,9 @@ func (p *Proxy) genNotImpl(request *dns.Msg) (resp *dns.Msg) {
 	return resp
 }
 
-func (p *Proxy) genWithRCode(r *dns.Msg, code int) (resp *dns.Msg) {
+func (p *Proxy) genWithRCode(req *dns.Msg, code int) (resp *dns.Msg) {
 	resp = &dns.Msg{}
-	resp.SetRcode(r, code)
+	resp.SetRcode(req, code)
 	resp.RecursionAvailable = true
 
 	return resp

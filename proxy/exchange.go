@@ -1,13 +1,13 @@
 package proxy
 
 import (
-	"sort"
 	"time"
 
 	"github.com/AdguardTeam/dnsproxy/upstream"
 	"github.com/AdguardTeam/golibs/errors"
 	"github.com/AdguardTeam/golibs/log"
 	"github.com/miekg/dns"
+	"golang.org/x/exp/slices"
 )
 
 // exchange -- sends DNS query to the upstream DNS server and returns the response
@@ -36,13 +36,16 @@ func (p *Proxy) exchange(req *dns.Msg, upstreams []upstream.Upstream) (reply *dn
 
 	errs := []error{}
 	for _, dnsUpstream := range sortedUpstreams {
-		reply, elapsed, err := exchangeWithUpstream(dnsUpstream, req)
+		var elapsed int
+		reply, elapsed, err = exchangeWithUpstream(dnsUpstream, req)
 		if err == nil {
-			p.updateRtt(dnsUpstream.Address(), elapsed)
+			p.updateRTT(dnsUpstream.Address(), elapsed)
+
 			return reply, dnsUpstream, err
 		}
+
 		errs = append(errs, err)
-		p.updateRtt(dnsUpstream.Address(), int(defaultTimeout/time.Millisecond))
+		p.updateRTT(dnsUpstream.Address(), int(defaultTimeout/time.Millisecond))
 	}
 
 	return nil, nil, errors.List("all upstreams failed to exchange request", errs...)
@@ -50,14 +53,15 @@ func (p *Proxy) exchange(req *dns.Msg, upstreams []upstream.Upstream) (reply *dn
 
 func (p *Proxy) getSortedUpstreams(u []upstream.Upstream) []upstream.Upstream {
 	// clone upstreams list to avoid race conditions
-	p.rttLock.Lock()
-	clone := make([]upstream.Upstream, len(u))
-	copy(clone, u)
+	clone := slices.Clone(u)
 
-	sort.Slice(clone, func(i, j int) bool {
-		return p.upstreamRttStats[clone[i].Address()] < p.upstreamRttStats[clone[j].Address()]
+	p.rttLock.Lock()
+	defer p.rttLock.Unlock()
+
+	slices.SortFunc(clone, func(a, b upstream.Upstream) (res int) {
+		// TODO(d.kolyshev): Use upstreams for sort comparing.
+		return p.upstreamRTTStats[a.Address()] - p.upstreamRTTStats[b.Address()]
 	})
-	p.rttLock.Unlock()
 
 	return clone
 }
@@ -67,31 +71,36 @@ func exchangeWithUpstream(u upstream.Upstream, req *dns.Msg) (*dns.Msg, int, err
 	startTime := time.Now()
 	reply, err := u.Exchange(req)
 	elapsed := time.Since(startTime)
+
+	addr := u.Address()
 	if err != nil {
-		log.Tracef(
-			"upstream %s failed to exchange %s in %s. Cause: %s",
-			u.Address(),
+		log.Error(
+			"dnsproxy: upstream %s failed to exchange %s in %s: %s",
+			addr,
 			req.Question[0].String(),
 			elapsed,
 			err,
 		)
 	} else {
-		log.Tracef(
-			"upstream %s successfully finished exchange of %s. Elapsed %s.",
-			u.Address(),
+		log.Debug(
+			"dnsproxy: upstream %s successfully finished exchange of %s; elapsed %s",
+			addr,
 			req.Question[0].String(),
 			elapsed,
 		)
 	}
+
 	return reply, int(elapsed.Milliseconds()), err
 }
 
-// updateRtt updates rtt in upstreamRttStats for given address
-func (p *Proxy) updateRtt(address string, rtt int) {
+// updateRTT updates the round-trip time in upstreamRTTStats for given address.
+func (p *Proxy) updateRTT(address string, rtt int) {
 	p.rttLock.Lock()
-	if p.upstreamRttStats == nil {
-		p.upstreamRttStats = map[string]int{}
+	defer p.rttLock.Unlock()
+
+	if p.upstreamRTTStats == nil {
+		p.upstreamRTTStats = map[string]int{}
 	}
-	p.upstreamRttStats[address] = (p.upstreamRttStats[address] + rtt) / 2
-	p.rttLock.Unlock()
+
+	p.upstreamRTTStats[address] = (p.upstreamRTTStats[address] + rtt) / 2
 }
