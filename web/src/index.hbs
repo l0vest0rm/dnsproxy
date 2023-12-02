@@ -1,0 +1,39 @@
+{{> header}}
+  <div class="row py-3">
+      <label for="" class="col col-form-label">日期</label>
+      <div class="col-3">
+        <select id="date" class="form-select">
+        </select>
+      </div>
+      <label for="" class="col col-form-label">IP过滤</label>
+      <div class="col-3">
+        <select id="filterIp" class="form-select">
+        </select>
+      </div>
+      <label for="" class="col col-form-label">类型</label>
+      <div class="col">
+        <select id="accessType" class="form-select" aria-label="">
+          <option value="">全部</option>
+          <option value="1">正常</option>
+          <option value="2">拦截</option>
+        </select>
+      </div>
+  </div>
+  
+<table class="table table-bordered">
+  <thead class="table-dark">
+    <tr>
+      <th scope="col">时间</th>
+      <th scope="col">类型</th>
+      <th scope="col">ip</th>
+      <th scope="col">域名</th>
+      <th scope="col">完整请求</th>
+      <th scope="col">操作</th>
+    </tr>
+  </thead>
+  <tbody id="querylog">
+  </tbody>
+</table>
+  </div>
+    </div>
+{{> footer}}

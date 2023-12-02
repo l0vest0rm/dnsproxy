@@ -1,0 +1,116 @@
+<!doctype html>
+<html lang='zh-CN'>
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title></title>
+  <link rel="stylesheet" href="css/bootstrap.min-5.2.2.css">
+  <link rel="stylesheet" href="css/bundle.css?v=3338908027751811"/>
+</head>
+<body>
+<header class="p-1 text-bg-dark">
+  <div class="container">
+    <div class="d-flex flex-wrap align-items-center justify-content-center fs-5">
+      <a href="#" class="d-flex align-items-start text-warning text-decoration-none">
+        英语学习
+      </a>
+      <ul class="nav col-auto me-auto mb-md-0">
+        <li class="nav-item">
+          <a href="index.html" class="nav-link px-2 text-white  ">访问记录</a>
+        </li>
+        <li class="nav-item">
+          <a href="control.html" class="nav-link px-2 text-white  ">控制配置</a>
+        </li>
+      </ul>
+      <div class="dropdown text-end">
+        <a class="nav-link px-2 text-white dropdown-toggle" href="#" id="my" data-bs-toggle="dropdown" aria-expanded="false">我的</a>
+        <ul class="dropdown-menu fs-5" aria-labelledby="my">
+          <li><a class="px-2 dropdown-item" href="#">登录</a></li>
+          <a href="#" class="px-2 dropdown-item" type="button" data-bs-toggle="offcanvas" data-bs-target="#setting-offcanvas" aria-controls="setting-offcanvas">设置</a>
+        </ul>
+      </div>
+    </div>
+  </div>
+</header>
+<div class="container-xxl">
+<div class="row">
+<div class="col-lg-12">
+  <div class="row py-3">
+    <div class="col">
+      <label for="ip" class="col col-form-label">IP</label>
+    </div>
+    <div class="col">
+      <input type="text" class="form-control" id="ip" value="all" placeholder="1.1.1.1">
+    </div>
+    <div class="col">
+      <label for="at" class="col col-form-label">控制</label>
+    </div>
+    <div class="col">
+      <select id="deny" class="form-select" aria-label="">
+        <option value="0">正常</option>
+        <option value="1">未知拦截</option>
+      </select>
+    </div>
+    <div class="col">
+      <button id="denySubmit" type="submit" class="btn btn-primary mb-3">提交更新</button>
+    </div>
+  </div>
+  <div class="row py-3">
+    <div class="col">
+      <label for="ip" class="col col-form-label">IP</label>
+    </div>
+    <div class="col">
+      <input type="text" class="form-control" id="ip" value="all" placeholder="1.1.1.1">
+    </div>
+    <div class="col">
+      <label for="domain" class="col col-form-label">域名</label>
+    </div>
+    <div class="col">
+      <input type="text" class="form-control" id="domain" placeholder="baidu.com">
+    </div>
+    <div class="col">
+      <label for="at" class="col col-form-label">控制</label>
+    </div>
+    <div class="col">
+      <input type="text" class="form-control" id="at" placeholder="100">
+    </div>
+    <div class="col">
+      <button id="controlSubmit" type="submit" class="btn btn-primary mb-3">提交更新</button>
+    </div>
+  </div>
+  <table class="table table-bordered">
+    <thead class="table-dark">
+      <tr>
+        <th scope="col">ip</th>
+        <th scope="col">封禁</th>
+      </tr>
+    </thead>
+    <tbody id="denyTable">
+    </tbody>
+  </table>
+  <table class="table table-bordered">
+    <thead class="table-dark">
+      <tr>
+        <th scope="col">ip</th>
+        <th scope="col">域名</th>
+        <th scope="col">当前控制</th>
+      </tr>
+    </thead>
+    <tbody id="controlTable">
+    </tbody>
+  </table>
+</div>
+</div>
+<div class="container">
+  <footer class="py-3 my-4">
+    <ul class="nav justify-content-center border-bottom pb-3 mb-3">
+      <li class="nav-item"><a href="#" class="nav-link px-2 text-muted">Home</a></li>
+      <li class="nav-item"><a href="#" class="nav-link px-2 text-muted">FAQs</a></li>
+    </ul>
+    <p class="text-center text-muted">© 2022 Company, Inc</p>
+  </footer>
+</div>
+  <script type="text/javascript" src="js/bootstrap.bundle.min-5.2.2.js"></script>
+  <script type="text/javascript" src="js/bundle.js?v=6220180144089840"></script>
+</body>
+</html>

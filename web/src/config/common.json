@@ -1,0 +1,7 @@
+{
+  "title": "",
+  "nav":[
+    {"href": "index.html", "text": "访问记录"},
+    {"href": "control.html", "text": "控制配置"}
+  ]
+}

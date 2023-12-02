@@ -1,0 +1,68 @@
+{{> header}}
+  <div class="row py-3">
+    <div class="col">
+      <label for="ip" class="col col-form-label">IP</label>
+    </div>
+    <div class="col">
+      <input type="text" class="form-control" id="ip" value="all" placeholder="1.1.1.1">
+    </div>
+    <div class="col">
+      <label for="at" class="col col-form-label">控制</label>
+    </div>
+    <div class="col">
+      <select id="deny" class="form-select" aria-label="">
+        <option value="0">正常</option>
+        <option value="1">未知拦截</option>
+      </select>
+    </div>
+    <div class="col">
+      <button id="denySubmit" type="submit" class="btn btn-primary mb-3">提交更新</button>
+    </div>
+  </div>
+  <div class="row py-3">
+    <div class="col">
+      <label for="ip" class="col col-form-label">IP</label>
+    </div>
+    <div class="col">
+      <input type="text" class="form-control" id="ip" value="all" placeholder="1.1.1.1">
+    </div>
+    <div class="col">
+      <label for="domain" class="col col-form-label">域名</label>
+    </div>
+    <div class="col">
+      <input type="text" class="form-control" id="domain" placeholder="baidu.com">
+    </div>
+    <div class="col">
+      <label for="at" class="col col-form-label">控制</label>
+    </div>
+    <div class="col">
+      <input type="text" class="form-control" id="at" placeholder="100">
+    </div>
+    <div class="col">
+      <button id="controlSubmit" type="submit" class="btn btn-primary mb-3">提交更新</button>
+    </div>
+  </div>
+  <table class="table table-bordered">
+    <thead class="table-dark">
+      <tr>
+        <th scope="col">ip</th>
+        <th scope="col">封禁</th>
+      </tr>
+    </thead>
+    <tbody id="denyTable">
+    </tbody>
+  </table>
+  <table class="table table-bordered">
+    <thead class="table-dark">
+      <tr>
+        <th scope="col">ip</th>
+        <th scope="col">域名</th>
+        <th scope="col">当前控制</th>
+      </tr>
+    </thead>
+    <tbody id="controlTable">
+    </tbody>
+  </table>
+</div>
+</div>
+{{> footer}}
