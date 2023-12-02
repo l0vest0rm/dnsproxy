@@ -3,6 +3,7 @@ let server = ''
 let data: any = undefined
 
 let ipNameMap: any = {
+  '192.168.31.200': 'mac-mini',
   '192.168.31.218': '小米笔记本',
   '192.168.31.251': '公司MBP',
   '192.168.31.162': '小米手机',

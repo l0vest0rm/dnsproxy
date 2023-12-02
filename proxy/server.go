@@ -3,12 +3,22 @@ package proxy
 import (
 	"context"
 	"fmt"
+	"gopkg.in/yaml.v3"
+	"io/ioutil"
 	"net"
+	"os"
+	"strings"
 	"time"
 
 	"github.com/AdguardTeam/golibs/log"
 	"github.com/miekg/dns"
 	"github.com/quic-go/quic-go"
+)
+
+const (
+	ACCESS_IGNORE = 0
+	ACCESS_NORMAL = 1
+	ACCESS_BLOCK  = 2
 )
 
 // startListeners configures and starts listener loops
@@ -78,9 +88,154 @@ func (p *Proxy) startListeners(ctx context.Context) error {
 	return nil
 }
 
+func (p *Proxy) accessDeny(ip string) bool {
+	if p.AccessDeny == nil {
+		return false
+	}
+
+	b, ok := p.AccessDeny[ip]
+	if ok && b {
+		return true
+	}
+	return false
+}
+
+func (p *Proxy) getAccessControlType(name string, ip string) int {
+	ac, ok := p.AccessControl[ip]
+	if !ok {
+		if p.accessDeny(ip) {
+			return ACCESS_BLOCK
+		} else {
+			return ACCESS_NORMAL
+		}
+	}
+
+	at, ok := ac[name]
+	if !ok {
+		if p.accessDeny(ip) {
+			return ACCESS_BLOCK
+		} else {
+			return ACCESS_NORMAL
+		}
+	}
+
+	if at == ACCESS_NORMAL {
+		if p.accessDeny(ip) {
+			return ACCESS_BLOCK
+		} else {
+			return ACCESS_NORMAL
+		}
+	}
+
+	if at <= ACCESS_BLOCK {
+		return at
+	}
+
+	//下面是时间限制
+	min := int(time.Now().Unix() / 60)
+	key := fmt.Sprintf("%s-%s-%d", ip, name, min)
+	_, ok = p.LimitMap[key]
+	if ok {
+		//找到了，已有的一分钟
+		return at
+	}
+
+	step := 1
+	for i := 1; i < 10; i++ {
+		//10分钟内的连续计算
+		key := fmt.Sprintf("%s-%s-%d", ip, name, min-i)
+		_, ok = p.LimitMap[key]
+		if ok {
+			step = i
+			break
+		}
+	}
+
+	//减少分钟数
+	p.mu.Lock()
+	p.LimitMap[key] = true
+	if at-step > ACCESS_BLOCK {
+		ac[name] = at - step
+	} else {
+		ac[name] = ACCESS_BLOCK
+	}
+	p.mu.Unlock()
+
+	bs, err := yaml.Marshal(p.OptionPtr)
+	if err != nil {
+		log.Error("getAccessControlType,Marshal:%v", err)
+	}
+
+	ioutil.WriteFile("config.yaml", bs, os.ModePerm)
+	return at
+}
+
+// 先考虑ip单独设置然后再全局设置
+func (p *Proxy) getFinalAccessControl(name string, ip string) int {
+	at := p.getAccessControlType(name, ip)
+	if at != ACCESS_NORMAL {
+		return at
+	}
+	return p.getAccessControlType(name, "all")
+}
+
+func (p *Proxy) writeLog(at int, clientIp string, domain string, name string) {
+	t := time.Now()
+	date := t.Format("20060102")
+	if p.QueryFile == nil || p.QueryFileDate != date {
+		if p.QueryFile != nil {
+			p.QueryFile.Close()
+		}
+
+		name := fmt.Sprintf("log/%s.log", date)
+		queryFile, err := os.OpenFile(name, os.O_APPEND|os.O_WRONLY|os.O_CREATE, 0644)
+		if err != nil {
+			log.Fatalf("queryFile,OpenFile:%v", err)
+		}
+		p.QueryFileDate = date
+		p.QueryFile = queryFile
+	}
+
+	loginfo := fmt.Sprintf("%d\t%d\t%s\t%s\t%s\n", time.Now().Unix(), at, clientIp, domain, name)
+	p.QueryFile.WriteString(loginfo)
+}
+
 // handleDNSRequest processes the incoming packet bytes and returns with an optional response packet.
 func (p *Proxy) handleDNSRequest(d *DNSContext) error {
 	p.logDNSMessage(d.Req)
+
+	clientIp := strings.Split(d.Addr.String(), ":")[0]
+	for _, r := range d.Req.Question {
+		if strings.HasSuffix(r.Name, ".local.") {
+			//过滤local
+			continue
+		}
+
+		name := r.Name
+		do := strings.Split(r.Name, ".")
+		ln := len(do)
+		if ln < 3 {
+			log.Info("too short name %s", name)
+		} else {
+			name = fmt.Sprintf("%s.%s", do[ln-3], do[ln-2])
+		}
+
+		if (name == "com.cn" || name == "net.cn") && ln > 3 {
+			name = fmt.Sprintf("%s.%s.%s", do[ln-4], do[ln-3], do[ln-2])
+		}
+
+		at := p.getFinalAccessControl(name, clientIp)
+		if at != ACCESS_IGNORE {
+			p.writeLog(at, clientIp, name, r.Name)
+			//loginfo := fmt.Sprintf("%d\t%d\t%s\t%s\t%s\n", time.Now().Unix(), at, clientIp, name, r.Name)
+			//p.QueryFile.WriteString(loginfo)
+		}
+		if at == ACCESS_BLOCK {
+			d.Res = p.genARecord(d.Req, net.IP{0, 0, 0, 0}, p.BlockTTL)
+			p.respond(d)
+			return nil
+		}
+	}
 
 	if d.Req.Response {
 		log.Debug("Dropping incoming Reply packet from %s", d.Addr.String())
@@ -218,4 +373,39 @@ func (p *Proxy) logDNSMessage(m *dns.Msg) {
 	} else {
 		log.Tracef("IN: %s", m)
 	}
+}
+
+func (s *Proxy) genARecord(request *dns.Msg, ip net.IP, ttl uint32) *dns.Msg {
+	resp := s.makeResponse(request)
+	resp.Answer = append(resp.Answer, s.genAnswerA(request, ip, ttl))
+	return resp
+}
+
+func (s *Proxy) hdr(req *dns.Msg, rrType uint16, ttl uint32) (h dns.RR_Header) {
+	return dns.RR_Header{
+		Name:   req.Question[0].Name,
+		Rrtype: rrType,
+		Ttl:    ttl,
+		Class:  dns.ClassINET,
+	}
+}
+
+func (s *Proxy) genAnswerA(req *dns.Msg, ip net.IP, ttl uint32) (ans *dns.A) {
+	return &dns.A{
+		Hdr: s.hdr(req, dns.TypeA, ttl),
+		A:   ip,
+	}
+}
+
+func (s *Proxy) makeResponse(req *dns.Msg) (resp *dns.Msg) {
+	resp = &dns.Msg{
+		MsgHdr: dns.MsgHdr{
+			RecursionAvailable: true,
+		},
+		Compress: true,
+	}
+
+	resp.SetReply(req)
+
+	return resp
 }

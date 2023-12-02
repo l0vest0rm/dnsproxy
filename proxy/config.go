@@ -6,6 +6,7 @@ import (
 	"net"
 	"net/netip"
 	"net/url"
+	"os"
 	"time"
 
 	"github.com/AdguardTeam/golibs/errors"
@@ -202,6 +203,21 @@ type Config struct {
 	// PreferIPv6 tells the proxy to prefer IPv6 addresses when bootstrapping
 	// upstreams that use hostnames.
 	PreferIPv6 bool
+
+	// 增加 access control
+	AccessControl map[string]map[string]int
+	// access deny
+	AccessDeny map[string]bool
+
+	OptionPtr interface{}
+
+	BlockTTL uint32 //Block TTL
+
+	//list
+	List map[string]map[string]bool
+	// dns query log
+	QueryFile     *os.File
+	QueryFileDate string
 }
 
 // validateConfig verifies that the supplied configuration is valid and returns

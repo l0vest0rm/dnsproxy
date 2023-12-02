@@ -1,0 +1,239 @@
+configpath: config.yaml
+verbose: false
+output: ""
+listen-addrs:
+    - 0.0.0.0
+listen-ports:
+    - 53
+https-port: []
+tls-port: []
+quic-port: []
+dnscrypt-port: []
+tls-crt: ""
+tls-key: ""
+tls-min-version: 0
+tls-max-version: 0
+insecure: false
+dnscrypt-config: ""
+http3: false
+upstream:
+    - 8.8.8.8:53
+bootstrap:
+    - 8.8.8.8:53
+fallback: []
+private-rdns-upstream: []
+all-servers: false
+fastest-addr: false
+timeout: 0s
+cache: true
+cache-size: 0
+cache-min-ttl: 30
+cache-max-ttl: 55
+cache-optimistic: false
+ratelimit: 0
+ratelimit-subnet-len-ipv4: 24
+ratelimit-subnet-len-ipv6: 56
+refuse-any: false
+edns: false
+edns-addr: ""
+dns64: false
+dns64-prefix: []
+https-server-name: dnsproxy
+https-userinfo: ""
+ipv6-disabled: false
+bogus-nxdomain: []
+udp-buf-size: 0
+max-go-routines: 0
+pprof: false
+version: false
+access-control:
+    192.168.31.1:
+        apple.cn: 0
+    all:
+        51.la: 0
+        126.net: 0
+        127.net: 0
+        163.com: 0
+        360buyimg.com: 0
+        360.cn: 2
+        adblockplus.org: 0
+        addthis.com: 0
+        adobe.com: 0
+        adobe.io: 0
+        adobedtm.com: 0
+        adobelogin.com: 0
+        adobesc.com: 0
+        akadns.net: 0
+        aliapp.org: 0
+        alibabadns.com: 0
+        alicdn.com: 0
+        alipay.com: 0
+        aliyun.com: 0
+        aliyuncs.com: 0
+        amap.com: 0
+        apple-cloudkit.com: 0
+        apple-dns.cn: 0
+        apple-dns.net: 0
+        apple.com: 0
+        apple.news: 0
+        baidu.com: 0
+        bcebos.com: 0
+        bdstatic.com: 0
+        bing.com: 0
+        bing.net: 0
+        biqugetv.net: 2
+        biqwo.com: 2
+        boyuart.cn: 0
+        bytecdn.cn: 0
+        bytedance.com: 0
+        bytednsdoc.com: 0
+        byteimg.com: 0
+        carbonads.net: 0
+        cjkypo.com: 2
+        cloudflare.com: 0
+        comodoca.com: 0
+        ctobsnssdk.com: 0
+        dbank.com: 0
+        dbankcdn.cn: 0
+        dbankcdn.com: 0
+        dbankcloud.cn: 0
+        dbankcloud.com: 0
+        demdex.net: 0
+        dianping.com: 0
+        digicert.com: 0
+        digitalcertvalidation.com: 0
+        digitaloceanspaces.com: 0
+        dingtalk.com: 0
+        dns.google: 0
+        douyin.com: 0
+        douyincdn.com: 0
+        douyinliving.com: 0
+        duokan.com: 2
+        eset.com: 0
+        flywaycdn.net: 0
+        foxitreader.cn: 0
+        foxitservice.com: 0
+        foxitsoftware.com: 0
+        getui.com: 0
+        getui.net: 0
+        gifshow.com: 0
+        github.com: 0
+        gitlab.com: 0
+        gitv.tv: 0
+        godaddy.com: 0
+        golang.org: 0
+        google-analytics.com: 0
+        google.com: 0
+        googleapis-cn.com: 0
+        googleapis.com: 0
+        googlesyndication.com: 0
+        googletagmanager.com: 0
+        googleusercontent.com: 0
+        gstatic.com: 0
+        gtimg.com: 0
+        haibian.com: 0
+        handjob.tw: 2
+        hicloud.com: 0
+        hitv.com: 0
+        hp.com: 0
+        huawei.com: 0
+        huaweicloud.com: 0
+        hubapi.com: 0
+        huoshanlive.com: 0
+        icloud.com: 0
+        icloud.com.cn: 0
+        ihuoshanlive.com: 0
+        in-addr.arpa: 0
+        inkuai.com: 0
+        intel.com: 0
+        ip6.arpa: 0
+        ixigua.com: 0
+        jd.com: 0
+        jiguang.cn: 0
+        jpush.cn: 0
+        jpush.io: 0
+        ks-cdn.com: 0
+        ksapisrv.com: 0
+        ksyun.com: 0
+        ksyuncdn.com: 0
+        ktrace-web-server.internal: 0
+        kuaishou.com: 0
+        kugou.com: 0
+        kugou.net: 0
+        kwaicdn.com: 0
+        kwaitalk.com: 0
+        kwimgs.com: 0
+        lencr.org: 0
+        letsencrypt.org: 0
+        live.com: 0
+        live.net: 0
+        meituan.com: 0
+        meituan.net: 0
+        mgtv.com: 0
+        mi-img.com: 0
+        mi.com: 0
+        microsoft.com: 0
+        miui.com: 0
+        miui.comtrashcleaner: 0
+        miwifi.com: 0
+        mmstat.com: 0
+        msftconnecttest.com: 0
+        msn.cn: 0
+        msn.com: 0
+        mxguan5.com: 2
+        myqcloud.com: 0
+        nasa.gov: 0
+        netease.com: 0
+        ntp.org: 0
+        nvidia.com: 0
+        office.com: 0
+        office.net: 0
+        pangolin-sdk-toutiao.com: 0
+        pddpic.com: 0
+        pinduoduo.com: 0
+        pki.goog: 0
+        qcloud.com: 0
+        qidian.com: 2
+        qlogo.cn: 0
+        qpic.cn: 0
+        qq.com: 0
+        qq.com.cn: 0
+        qtlcdn.com: 0
+        sfx.ms: 0
+        skype.com: 0
+        snssdk.com: 0
+        sogou.com: 0
+        sohu.com: 0
+        speiyou.com: 2
+        staticfile.org: 0
+        superscript.cc: 0
+        taobao.com: 0
+        tencent-cloud.net: 0
+        tencent.com: 0
+        toutiaoapi.com: 0
+        trafficmanager.net: 0
+        typekit.net: 0
+        umeng.com: 0
+        umengcloud.com: 0
+        usertrust.com: 0
+        vcsoat.cn: 0
+        vip.com: 0
+        vivo.com.cn: 0
+        volccdn.com: 0
+        weclassroom.com: 0
+        windows.com: 0
+        windowsupdate.com: 0
+        withgoogle.com: 0
+        wo.com.cn: 0
+        xhscdn.com: 0
+        xiaohongshu.com: 0
+        xiaomi.com: 0
+        xiaomi.net: 0
+        ygshu.com: 2
+        yinxiang.com: 0
+        youdao.com: 0
+        yximgs.com: 0
+        zijieapi.com: 0
+        zuiaixs.com: 2
+access-deny: {}
+admin-listen-addr: :3001

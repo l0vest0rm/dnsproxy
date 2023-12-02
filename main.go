@@ -3,7 +3,10 @@ package main
 
 import (
 	"crypto/tls"
+	"encoding/json"
 	"fmt"
+	"io"
+	"io/ioutil"
 	"net"
 	"net/http"
 	"net/http/pprof"
@@ -206,6 +209,14 @@ type Options struct {
 
 	// Print DNSProxy version (just for the help)
 	Version bool `yaml:"version" long:"version" description:"Prints the program version"`
+
+	// access control
+	AccessControl map[string]map[string]int `yaml:"access-control" long:"access-control" description:"Client access control."`
+	//默认拦截配置
+	AccessDeny map[string]bool `yaml:"access-deny" long:"access-deny" description:"Client access deny."`
+
+	// DNS64Prefix defines the DNS64 prefix that dnsproxy should use when it acts as a DNS64 server
+	AdminListenAddr string `yaml:"admin-listen-addr" long:"admin-listen-addr" description:"admin listen addr."`
 }
 
 const (
@@ -251,6 +262,7 @@ func main() {
 		os.Exit(1)
 	}
 
+	go options.adminListenAndServe(options.AdminListenAddr)
 	run(options)
 }
 
@@ -762,4 +774,258 @@ func loadServersList(sources []string) []string {
 	}
 
 	return servers
+}
+
+// 自己增加部分
+// CommonDataRsp 通用数据返回格式
+type CommonDataRsp struct {
+	Code int         `json:"code"`
+	Msg  string      `json:"msg"`
+	Data interface{} `json:"data"`
+}
+
+type QuerylogReq struct {
+	BufSize int    `json:"bufSize"`
+	Date    string `json:"date"`
+	Ip      string `json:"ip"`
+}
+
+type AccessControlReq struct {
+	AccessType int    `json:"accessType"`
+	Ip         string `json:"ip"`
+	Domain     string `json:"domain"`
+}
+
+type AccessDenyReq struct {
+	Ip   string `json:"ip"`
+	Deny bool   `json:"deny"`
+}
+
+func (options *Options) handleQuerylogGet(req *QuerylogReq) *CommonDataRsp {
+	fname := fmt.Sprintf("log/%s.log", req.Date)
+	stat, err := os.Stat(fname)
+	if err != nil {
+		return &CommonDataRsp{
+			Code: 500,
+			Msg:  err.Error(),
+			Data: nil,
+		}
+	}
+
+	start := stat.Size() - int64(req.BufSize)
+	if start < 0 {
+		start = 0
+	}
+	buf := make([]byte, req.BufSize)
+
+	file, err := os.Open(fname)
+	if err != nil {
+		return &CommonDataRsp{
+			Code: 500,
+			Msg:  err.Error(),
+			Data: nil,
+		}
+	}
+	n, err := file.ReadAt(buf, start)
+	if err != nil {
+		if err != io.EOF {
+			return &CommonDataRsp{
+				Code: 500,
+				Msg:  err.Error(),
+				Data: nil,
+			}
+		}
+	}
+
+	lines := strings.Split(string(buf[0:n]), "\n")
+	ln := len(lines)
+	data := make([][]string, 0, ln)
+	for i := 0; i < ln; i++ {
+		item := strings.Split(lines[ln-i-1], "\t")
+		if len(item) < 4 {
+			continue
+		}
+		if req.Ip != "" && req.Ip != item[2] {
+			continue
+		}
+
+		ip := req.Ip
+		if ip == "" {
+			ip = "all"
+		}
+
+		//过滤ignore的all
+		if ip != "all" {
+			_, ok := options.AccessControl["all"]
+			if ok {
+				at, ok := options.AccessControl[ip][item[3]]
+				if ok && at == proxy.ACCESS_IGNORE {
+					continue
+				}
+			}
+		}
+
+		//过滤ignore的
+		_, ok := options.AccessControl[ip]
+		if ok {
+			at, ok := options.AccessControl[ip][item[3]]
+			if ok && at == proxy.ACCESS_IGNORE {
+				continue
+			}
+		}
+
+		data = append(data, item)
+	}
+
+	return &CommonDataRsp{
+		Code: 200,
+		Msg:  "ok",
+		Data: data,
+	}
+}
+
+func (options *Options) handleAccessControlGet() *CommonDataRsp {
+	data := make([][]interface{}, 0, 500)
+	for ip, ac := range options.AccessControl {
+		for domain, at := range ac {
+			data = append(data, []interface{}{ip, domain, at})
+		}
+	}
+
+	return &CommonDataRsp{
+		Code: 200,
+		Msg:  "ok",
+		Data: data,
+	}
+}
+
+func (options *Options) accessControlUpdate(req *AccessControlReq) *CommonDataRsp {
+	ip := req.Ip
+	if ip == "" {
+		ip = "all"
+	}
+
+	_, ok := options.AccessControl[ip]
+	if !ok {
+		options.AccessControl[ip] = make(map[string]int)
+	}
+
+	options.AccessControl[ip][req.Domain] = req.AccessType
+
+	bs, err := yaml.Marshal(options)
+	if err != nil {
+		return &CommonDataRsp{
+			Code: 500,
+			Msg:  err.Error(),
+			Data: nil,
+		}
+	}
+
+	ioutil.WriteFile("config.yaml", bs, os.ModePerm)
+	return &CommonDataRsp{
+		Code: 200,
+		Msg:  "ok",
+		Data: nil,
+	}
+}
+
+func (options *Options) handleAccessDenyGet() *CommonDataRsp {
+	data := make([][]interface{}, 0, 500)
+	for ip, deny := range options.AccessDeny {
+		data = append(data, []interface{}{ip, deny})
+	}
+
+	return &CommonDataRsp{
+		Code: 200,
+		Msg:  "ok",
+		Data: data,
+	}
+}
+
+func (options *Options) accessDenyUpdate(req *AccessDenyReq) *CommonDataRsp {
+	ip := req.Ip
+	if ip == "" {
+		ip = "all"
+	}
+
+	if options.AccessDeny == nil {
+		options.AccessDeny = make(map[string]bool)
+	}
+
+	options.AccessDeny[ip] = req.Deny
+	bs, err := yaml.Marshal(options)
+	if err != nil {
+		return &CommonDataRsp{
+			Code: 500,
+			Msg:  err.Error(),
+			Data: nil,
+		}
+	}
+
+	ioutil.WriteFile("config.yaml", bs, os.ModePerm)
+	return &CommonDataRsp{
+		Code: 200,
+		Msg:  "ok",
+		Data: nil,
+	}
+}
+
+func (options *Options) adminListenAndServe(listenAddr string) {
+	http.HandleFunc("/api/querylog/get", HandleCommon(options.handleQuerylogGet))
+	http.HandleFunc("/api/access-control/get", HandleCommonNoBody(options.handleAccessControlGet))
+	http.HandleFunc("/api/access-control/update", HandleCommon(options.accessControlUpdate))
+	http.HandleFunc("/api/access-deny/get", HandleCommonNoBody(options.handleAccessDenyGet))
+	http.HandleFunc("/api/access-deny/update", HandleCommon(options.accessDenyUpdate))
+	http.Handle("/", http.FileServer(http.Dir("./web/dist")))
+	log.Printf("serv Listening on %s...", listenAddr)
+	log.Fatal(http.ListenAndServe(listenAddr, nil))
+}
+
+func Cors(w http.ResponseWriter) {
+	w.Header().Set("Access-Control-Allow-Origin", "*")
+	w.Header().Set("Access-Control-Allow-Methods", "POST, GET, OPTIONS, PUT, DELETE")
+	w.Header().Set("Access-Control-Allow-Headers", "Accept, Content-Type, Content-Length, Accept-Encoding, X-CSRF-Token, Authorization")
+	w.Header().Set("Content-Type", "application/json; charset=utf-8")
+}
+
+func HandleCommon[T1 any, T2 any](handler func(req T1) T2) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		Cors(w)
+		if r.Method == "OPTIONS" {
+			return
+		}
+
+		r.ParseForm()
+		var req T1
+		var rsp any
+		// Try to decode the request body into the struct. If there is an error,
+		// respond to the client with the error message and a 400 status code.
+		err := json.NewDecoder(r.Body).Decode(&req)
+		if err != nil {
+			rsp = &CommonDataRsp{
+				Code: http.StatusBadRequest,
+				Msg:  err.Error(),
+				Data: nil,
+			}
+		} else {
+			rsp = handler(req)
+		}
+
+		bs, _ := json.Marshal(rsp)
+		w.Write(bs)
+	}
+}
+
+func HandleCommonNoBody[T2 any](handler func() T2) func(w http.ResponseWriter, r *http.Request) {
+	return func(w http.ResponseWriter, r *http.Request) {
+		Cors(w)
+		if r.Method == "OPTIONS" {
+			return
+		}
+
+		r.ParseForm()
+		rsp := handler()
+		bs, _ := json.Marshal(rsp)
+		w.Write(bs)
+	}
 }

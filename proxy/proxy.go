@@ -176,6 +176,10 @@ type Proxy struct {
 	// See also: https://github.com/AdguardTeam/AdGuardHome/issues/2242.
 	requestGoroutinesSema semaphore
 
+	//时间限制的map
+	mu       sync.RWMutex
+	LimitMap map[string]bool
+
 	// Config is the proxy configuration.
 	//
 	// TODO(a.garipov): Remove this embed and create a proper initializer.
